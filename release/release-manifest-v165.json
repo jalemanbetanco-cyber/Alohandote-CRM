@@ -1,0 +1,18 @@
+{
+  "version": "1.0.165",
+  "baseline": "V164 funcional aprobado por usuario",
+  "scope": [
+    "go-live preflight",
+    "ci/cd quality gate",
+    "deployment runbook",
+    "qa regression checklist",
+    "rollback plan",
+    "production environment template"
+  ],
+  "doesNotChange": [
+    "caja compra/venta validada en V164",
+    "catálogos y documentos validados en V164",
+    "navegación y módulos restaurados"
+  ],
+  "goNoGoCommand": "npm run release:go-no-go"
+}

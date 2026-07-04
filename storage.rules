@@ -1,0 +1,45 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function userPath() { return /databases/(default)/documents/users/$(request.auth.uid); }
+    function hasUserDoc() { return signedIn() && firestore.exists(userPath()); }
+    function userDoc() { return firestore.get(userPath()); }
+    function isActive() { return signedIn() && (!hasUserDoc() || (userDoc().data.isActive != false && userDoc().data.active != false)); }
+    function role() { return hasUserDoc() ? userDoc().data.role : ''; }
+    function isAdmin() { return isActive() && role() in ['admin', 'Administrador', 'administrador']; }
+    function isSupervisor() { return isActive() && role() in ['supervisor', 'Supervisor']; }
+    function isOperator() { return isActive() && role() in ['operator_general', 'operator_rentcar', 'operator_lodging', 'vehicle_reception', 'Operador Renta Car', 'Operador Alojamientos', 'Recepción Vehículos', 'Operador']; }
+    function isSeller() { return isActive() && role() in ['seller', 'seller_all', 'seller_lodging', 'Vendedor', 'Vendedor Renta Car y Alojamientos', 'Vendedor Alojamientos']; }
+    function canUploadOperations() { return isAdmin() || isSupervisor() || isOperator() || isSeller(); }
+    function isAllowedSize() { return request.resource != null && request.resource.size < 30 * 1024 * 1024; }
+    function isImage() { return request.resource != null && request.resource.contentType.matches('image/.*'); }
+    function isPdf() { return request.resource != null && request.resource.contentType == 'application/pdf'; }
+    function isAllowedFile() { return isAllowedSize() && (isImage() || isPdf()); }
+
+    // Documentos de reservas: licencias, cédulas, comprobantes y soportes PDF/imagen.
+    match /reservation-docs/{uid}/{fileName} {
+      allow read: if isActive();
+      allow write: if isActive() && request.auth.uid == uid && isAllowedFile();
+    }
+
+    // Check-in / recepción de vehículos: evidencia operativa.
+    match /vehicle-checkins/{uid}/{fileName} {
+      allow read: if isActive();
+      allow write: if canUploadOperations() && request.auth.uid == uid && isAllowedFile();
+    }
+
+    // Catálogos y fotos maestras futuras: solo administración/supervisión.
+    match /catalog-photos/{assetId}/{fileName} {
+      allow read: if isActive();
+      allow write: if (isAdmin() || isSupervisor()) && isAllowedFile();
+    }
+
+    // Fallback seguro V207: ninguna ruta nueva queda abierta por defecto.
+    match /{allPaths=**} {
+      allow read: if isActive();
+      allow write: if false;
+    }
+  }
+}

@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Alohandote - Recepción de vehículos</title>
+  <style>
+    :root{font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#222;background:#f7f2ea}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;background:linear-gradient(135deg,#f8f4ed,#fff);display:grid;place-items:center;padding:18px}
+    .card{width:min(760px,100%);background:#fff;border-radius:28px;padding:24px;box-shadow:0 22px 70px rgba(0,0,0,.14);display:grid;gap:18px}
+    .head{display:grid;grid-template-columns:120px 1fr;gap:18px;align-items:center;border-bottom:1px solid #eee;padding-bottom:14px}
+    .logo{width:120px;height:120px;object-fit:contain}
+    .eyebrow{text-transform:uppercase;font-size:12px;letter-spacing:.12em;color:#8d6a3f;font-weight:900}
+    h1{font-size:26px;line-height:1.05;margin:4px 0 0;letter-spacing:-.04em}
+    p{margin:0;color:#666;line-height:1.45}
+    form{display:grid;gap:14px}
+    label{display:grid;gap:7px;font-weight:800}
+    input,select,textarea{width:100%;border:1px solid #e1e1e1;border-radius:14px;padding:13px 14px;font:inherit;font-weight:700;background:#fff}
+    textarea{resize:vertical}
+    .two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .file{border:1px dashed #d7d0c7;background:#fafafa;border-radius:16px;padding:14px}
+    .file small{font-weight:700;color:#777;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    button{border:0;border-radius:999px;background:#ff385c;color:#fff;font-weight:900;padding:15px 18px;font:inherit;cursor:pointer}
+    button:disabled{opacity:.6;cursor:not-allowed}
+    .msg{padding:12px 14px;border-radius:14px;font-weight:800}
+    .ok{background:#eafff2;color:#08743b;border:1px solid #bdeccc}
+    .err{background:#fff0f0;color:#b00020;border:1px solid #ffd1d1}
+    .hint{font-size:13px;color:#777;background:#fafafa;border:1px solid #eee;border-radius:14px;padding:12px}
+    .selected-vehicle{display:none;background:#eafff2;border:1px solid #bdeccc;border-radius:14px;padding:10px 12px;color:#08743b;font-weight:900}
+    .search-help{font-size:12px;color:#777;font-weight:700;margin-top:-2px}
+    @media(max-width:620px){.head{grid-template-columns:1fr;text-align:center}.logo{margin:auto}.two{grid-template-columns:1fr}h1{font-size:24px}}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <section class="head">
+      <img class="logo" src="/alohandote-logo.png" alt="Alohandote" />
+      <div>
+        <div class="eyebrow">Recepción de vehículos</div>
+        <h1>Formulario de recepción</h1>
+      </div>
+    </section>
+
+    <div id="message" style="display:none"></div>
+
+    <form id="form">
+      <label>Buscar vehículo
+        <input id="vehicleSearch" type="search" list="vehicleOptions" placeholder="Escribe placa, modelo o nombre del vehículo" autocomplete="off" required />
+        <datalist id="vehicleOptions"></datalist>
+        <small class="search-help">Selecciona el vehículo desde la sugerencia para evitar errores.</small>
+      </label>
+      <input id="vehicleId" type="hidden" />
+      <div id="selectedVehicleBox" class="selected-vehicle"></div><label id="reservationWrap" style="display:none">Reserva relacionada<select id="reservationId"><option value="">Sin reserva relacionada</option></select></label><div id="kmInfo" class="selected-vehicle" style="display:none"></div>
+
+      <div class="two">
+        <label>Kilometraje recibido
+          <input id="currentKm" type="number" min="0" placeholder="Ej: 45650" required />
+        </label>
+        <label>Recibido por
+          <input id="receivedBy" type="text" placeholder="Nombre del receptor" required />
+        </label>
+      </div>
+
+      <div class="two">
+        <label>Nivel de combustible
+          <select id="fuelLevel">
+            <option>Completo</option>
+            <option>3/4</option>
+            <option>Medio tanque</option>
+            <option>1/4</option>
+            <option>Bajo</option>
+          </select>
+        </label>
+        <label>Estado general
+          <select id="generalStatus">
+            <option>Bueno</option>
+            <option>Con observación</option>
+            <option>Requiere revisión</option>
+            <option>Requiere mantenimiento</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="two">
+        <label class="file">Foto tablero
+          <input id="dashboardPhoto" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" />
+          <small id="dashboardName">Odómetro / tablero</small>
+        </label>
+        <label class="file">Foto vehículo
+          <input id="vehiclePhoto" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" />
+          <small id="vehiclePhotoName">Exterior del vehículo</small>
+        </label>
+      </div>
+
+      <label>Observación
+        <textarea id="notes" rows="4" placeholder="Daños, limpieza, combustible, accesorios o comentario del cliente..."></textarea>
+      </label>
+
+      <button id="submitBtn" type="submit">Guardar recepción</button>
+    </form>
+
+    <div class="hint">
+      Esta página es solo para recepción. No permite ver reservas, clientes ni reportes.
+    </div>
+  </main>
+
+  <script type="module">
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.4/firebase-app.js';
+    import { getFirestore, collection, addDoc, doc, updateDoc, onSnapshot, serverTimestamp } from 'https://www.gstatic.com/firebasejs/10.12.4/firebase-firestore.js';
+    import { getStorage, ref, uploadBytes, getDownloadURL } from 'https://www.gstatic.com/firebasejs/10.12.4/firebase-storage.js';
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyDSlA3qXw-94ho99VGFNR0WXICbTjOCFRA",
+      authDomain: "alohandote-rent-calendar.firebaseapp.com",
+      projectId: "alohandote-rent-calendar",
+      storageBucket: "alohandote-rent-calendar.firebasestorage.app",
+      messagingSenderId: "628092446616",
+      appId: "1:628092446616:web:e114352ceeda706739aded",
+      measurementId: "G-B63M4TQPSC"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    const storage = getStorage(app);
+
+    const vehicleSearch = document.getElementById('vehicleSearch');
+    const vehicleOptions = document.getElementById('vehicleOptions');
+    const vehicleIdInput = document.getElementById('vehicleId');
+    const selectedVehicleBox = document.getElementById('selectedVehicleBox');
+    const currentKmInput = document.getElementById('currentKm');
+    const message = document.getElementById('message');
+    const submitBtn = document.getElementById('submitBtn');
+    let vehicles = [];
+    let reservations = [];
+    let selectedReservation = null;
+    let selectedVehicle = null;
+
+    function vehicleLabel(vehicle) {
+      return [vehicle.name, vehicle.plate, vehicle.brand, vehicle.model].filter(Boolean).join(' · ');
+    }
+
+    function showMessage(text, type='ok') {
+      message.style.display = 'block';
+      message.className = `msg ${type}`;
+      message.textContent = text;
+    }
+
+    function hideMessage() {
+      message.style.display = 'none';
+      message.textContent = '';
+    }
+
+    function safeName(name='archivo') {
+      return String(name).replace(/[^a-zA-Z0-9_.-]/g, '_');
+    }
+
+    function setSelectedVehicle(vehicle) {
+      selectedVehicle = vehicle || null;
+      vehicleIdInput.value = selectedVehicle?.id || '';
+      if (selectedVehicle) {
+        selectedVehicleBox.style.display = 'block';
+        selectedVehicleBox.textContent = `Vehículo seleccionado: ${vehicleLabel(selectedVehicle)}`;
+        currentKmInput.value = selectedVehicle.currentKm || '';
+        if (typeof updateReservationOptions === 'function') updateReservationOptions();
+      } else {
+        selectedVehicleBox.style.display = 'none';
+        selectedVehicleBox.textContent = '';
+        if (typeof updateReservationOptions === 'function') updateReservationOptions();
+      }
+    }
+
+    async function uploadFile(file, kind) {
+      if (!file) return null;
+      const path = `vehicle-checkins/public/${Date.now()}-${kind}-${safeName(file.name)}`;
+      const fileRef = ref(storage, path);
+      await uploadBytes(fileRef, file);
+      const url = await getDownloadURL(fileRef);
+      return { name: file.name, type: file.type, url, path, uploadedAt: new Date().toISOString() };
+    }
+
+    onSnapshot(collection(db, 'vehicles'), (snapshot) => {
+      vehicles = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      vehicleOptions.innerHTML = '';
+      vehicles.forEach((vehicle) => {
+        const option = document.createElement('option');
+        option.value = vehicleLabel(vehicle);
+        vehicleOptions.appendChild(option);
+      });
+      if (!vehicles.length) showMessage('No hay vehículos creados en la base de datos.', 'err');
+    }, (error) => {
+      console.error(error);
+      showMessage('No se pudieron cargar los vehículos. Revisa las reglas públicas de Firestore.', 'err');
+    });
+    onSnapshot(collection(db, 'reservations'), (snapshot) => {
+      reservations = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+      const params = new URLSearchParams(window.location.search);
+      const reservationId = params.get('reserva') || params.get('reservation');
+      if (reservationId) {
+        const reservation = reservations.find((item) => item.id === reservationId);
+        if (reservation) {
+          selectedReservation = reservation;
+          const vehicle = vehicles.find((item) => item.id === reservation.vehicleId);
+          if (vehicle) {
+            vehicleSearch.value = vehicleLabel(vehicle);
+            setSelectedVehicle(vehicle);
+          }
+          currentKmInput.placeholder = reservation.deliveryKm ? `Mayor a ${reservation.deliveryKm}` : 'Ej: 45650';
+          updateReservationOptions();
+        }
+      }
+    }, (error) => {
+      console.error(error);
+      showMessage('No se pudieron cargar las reservas para vincular recepción.', 'err');
+    });
+
+    function updateReservationOptions() {
+      const wrap = document.getElementById('reservationWrap');
+      const select = document.getElementById('reservationId');
+      const info = document.getElementById('kmInfo');
+      if (!selectedVehicle) {
+        wrap.style.display = 'none';
+        info.style.display = 'none';
+        return;
+      }
+      const list = reservations.filter((item) => item.vehicleId === selectedVehicle.id && item.status === 'reserved');
+      select.innerHTML = '<option value="">Sin reserva relacionada</option>';
+      list.forEach((reservation) => {
+        const option = document.createElement('option');
+        option.value = reservation.id;
+        option.textContent = `${reservation.customerName || 'Sin cliente'} · ${reservation.startDate || ''} - ${reservation.endDate || ''} · KM entrega ${reservation.deliveryKm || 'N/D'}`;
+        select.appendChild(option);
+      });
+      wrap.style.display = list.length ? 'grid' : 'none';
+      if (selectedReservation) select.value = selectedReservation.id;
+      if (selectedReservation?.deliveryKm) {
+        info.style.display = 'block';
+        info.textContent = `KM de entrega registrado: ${Number(selectedReservation.deliveryKm).toLocaleString('es-VE')} km`;
+      } else {
+        info.style.display = 'none';
+      }
+    }
+
+    document.getElementById('reservationId').addEventListener('change', () => {
+      selectedReservation = reservations.find((item) => item.id === document.getElementById('reservationId').value) || null;
+      updateReservationOptions();
+    });
+
+
+    vehicleSearch.addEventListener('input', () => {
+      hideMessage();
+      const value = vehicleSearch.value.trim().toLowerCase();
+      const exact = vehicles.find((vehicle) => vehicleLabel(vehicle).toLowerCase() === value);
+      if (exact) {
+        selectedReservation = null;
+        setSelectedVehicle(exact);
+        return;
+      }
+      setSelectedVehicle(null);
+    });
+
+    vehicleSearch.addEventListener('change', () => {
+      const value = vehicleSearch.value.trim().toLowerCase();
+      const exact = vehicles.find((vehicle) => vehicleLabel(vehicle).toLowerCase() === value);
+      const partial = vehicles.find((vehicle) => vehicleLabel(vehicle).toLowerCase().includes(value));
+      selectedReservation = null;
+      setSelectedVehicle(exact || partial || null);
+      if (!selectedVehicle && value) {
+        showMessage('No se encontró el vehículo. Escribe y selecciona una sugerencia válida.', 'err');
+      }
+    });
+
+    document.getElementById('dashboardPhoto').addEventListener('change', (event) => {
+      document.getElementById('dashboardName').textContent = event.target.files?.[0]?.name || 'Odómetro / tablero';
+    });
+
+    document.getElementById('vehiclePhoto').addEventListener('change', (event) => {
+      document.getElementById('vehiclePhotoName').textContent = event.target.files?.[0]?.name || 'Exterior del vehículo';
+    });
+
+    document.getElementById('form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      hideMessage();
+
+      if (!selectedVehicle || !vehicleIdInput.value) {
+        showMessage('Debes buscar y seleccionar un vehículo válido antes de guardar.', 'err');
+        vehicleSearch.focus();
+        return;
+      }
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Guardando...';
+
+      try {
+        const dashboardPhoto = await uploadFile(document.getElementById('dashboardPhoto').files[0], 'tablero');
+        const vehiclePhoto = await uploadFile(document.getElementById('vehiclePhoto').files[0], 'vehiculo');
+        const now = new Date().toISOString();
+        const receivedBy = document.getElementById('receivedBy').value.trim();
+
+        await addDoc(collection(db, 'vehicleCheckins'), {
+          vehicleId: selectedVehicle.id,
+          vehicleName: selectedVehicle.name || '',
+          vehiclePlate: selectedVehicle.plate || '',
+          currentKm: currentKmInput.value,
+          fuelLevel: document.getElementById('fuelLevel').value,
+          generalStatus: document.getElementById('generalStatus').value,
+          notes: document.getElementById('notes').value.trim(),
+          dashboardPhoto,
+          vehiclePhoto,
+          createdByName: receivedBy,
+          createdByEmail: '',
+          createdByUid: 'public-reception',
+          createdAt: now,
+          createdAtServer: serverTimestamp()
+        });
+
+        const reservationSelectValue = document.getElementById('reservationId').value;
+        const reservationToUpdate = selectedReservation || reservations.find((item) => item.id === reservationSelectValue);
+        if (reservationToUpdate) {
+          const delivered = Number(reservationToUpdate.deliveryKm || 0);
+          const received = Number(currentKmInput.value || 0);
+          await updateDoc(doc(db, 'reservations', reservationToUpdate.id), {
+            kmRecepcion: currentKmInput.value,
+            kmRecorridos: delivered && received >= delivered ? String(received - delivered) : '',
+            receptionAt: now,
+            receivedBy,
+            fuelLevelReception: document.getElementById('fuelLevel').value,
+            receptionStatus: document.getElementById('generalStatus').value,
+            receptionNotes: document.getElementById('notes').value.trim(),
+            dashboardPhoto,
+            vehiclePhoto
+          });
+        }
+
+        await updateDoc(doc(db, 'vehicles', selectedVehicle.id), {
+          currentKm: currentKmInput.value,
+          lastKmUpdateAt: now,
+          lastKmUpdatedBy: receivedBy
+        });
+
+        showMessage('Recepción guardada correctamente. El kilometraje ya quedó actualizado.');
+        const previousVehicleLabel = vehicleSearch.value;
+        document.getElementById('form').reset();
+        vehicleSearch.value = previousVehicleLabel;
+        setSelectedVehicle(null);
+        document.getElementById('dashboardName').textContent = 'Odómetro / tablero';
+        document.getElementById('vehiclePhotoName').textContent = 'Exterior del vehículo';
+      } catch (error) {
+        console.error(error);
+        showMessage(error.message || 'No se pudo guardar la recepción. Revisa Firebase y las reglas públicas.', 'err');
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Guardar recepción';
+      }
+    });
+  </script>
+</body>
+</html>

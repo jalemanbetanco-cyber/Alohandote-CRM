@@ -761,7 +761,11 @@ async function captureAlohandoteNode(node, options){
   if(options.minHeight) node.style.minHeight=options.minHeight;
   await new Promise(r=>setTimeout(r,180));
   var rect=node.getBoundingClientRect();
-  var captureWidth=Math.ceil(Math.max(node.scrollWidth,rect.width,options.pixelWidth));
+  var isMobile=/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
+  var captureWidth=isMobile ? 794 : Math.ceil(Math.max(node.scrollWidth,rect.width,options.width||0));
+  node.style.width=isMobile ? '794px' : node.style.width;
+  node.style.maxWidth=isMobile ? '794px' : node.style.maxWidth;
+  node.style.minWidth=isMobile ? '794px' : node.style.minWidth;
   var captureHeight=Math.ceil(Math.max(node.scrollHeight,rect.height));
   window.scrollTo(0,0);
   document.body.style.overflow='hidden';

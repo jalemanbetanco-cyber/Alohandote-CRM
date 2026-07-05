@@ -1857,7 +1857,7 @@ export default function App() {
   }
   async function logout() { if (auth) await signOut(auth) }
 
-  const canUseCloudData = publicReceptionMode || publicOperationsMode || enableDemoMode || Boolean(user)
+  const canUseCloudData = publicReceptionMode || publicOperationsMode || enableDemoMode || (Boolean(user) && Boolean(profile?.role))
   const vehiclesStore = useFirestoreOrLocalStorage('vehicles', INITIAL_VEHICLES, canUseCloudData)
   const reservationsStore = useFirestoreOrLocalStorage('reservations', [], canUseCloudData)
   const accommodationsStore = useFirestoreOrLocalStorage('accommodations', INITIAL_ACCOMMODATIONS, canUseCloudData)
@@ -6556,7 +6556,7 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
     else if (operation.reservationType === 'lodging' && operation.operation === 'reception') openCleaningForm(operation)
   }, [publicOperationsMode, publicTaskId, publicTokenRecord, operationsHandoverRows, editingVehicleDelivery, editingVehicleCheckin, editingCleaningTask])
 
-  if (authLoading) return <main className="login-shell"><section className="login-card"><h1>Cargando...</h1><p>Validando sesión.</p></section></main>
+  if (authLoading || (user && !profile?.role)) return <main className="login-shell"><section className="login-card"><h1>Cargando...</h1><p>Validando sesión y datos del sistema.</p></section></main>
   if (!isFirebaseReady && !enableDemoMode && !publicReceptionMode && !publicOperationsMode) return <FirebaseSetupRequired />
   if (isFirebaseReady && !user && !publicReceptionMode && !publicOperationsMode) return <LoginScreen onLogin={login} loading={loginLoading} error={loginError} />
 

@@ -1,0 +1,160 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function userPath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function hasUserDoc() { return signedIn() && exists(userPath()); }
+    function userDoc() { return get(userPath()); }
+
+    // Compatibilidad V206: si aún no existe ficha en /users, el usuario autenticado no queda bloqueado.
+    // Blindaje V207: si la ficha existe y está inactiva, se bloquea.
+    function isActive() {
+      return signedIn() && (!hasUserDoc() || (userDoc().data.isActive != false && userDoc().data.active != false));
+    }
+
+    function role() { return hasUserDoc() ? userDoc().data.role : ''; }
+    function isAdmin() { return isActive() && role() in ['admin', 'Administrador', 'administrador']; }
+    function isSupervisor() { return isActive() && role() in ['supervisor', 'Supervisor']; }
+    function isAccounting() { return isActive() && role() in ['accounting', 'Contabilidad', 'contabilidad']; }
+    function isMaintenance() { return isActive() && role() in ['maintenance', 'Mantenimiento', 'mantenimiento']; }
+    function isCleaning() { return isActive() && role() in ['cleaning', 'Limpieza', 'limpieza']; }
+    function isOperator() { return isActive() && role() in ['operator_general', 'operator_rentcar', 'operator_lodging', 'vehicle_reception', 'logistics', 'Logística', 'Logistica', 'Operador Renta Car', 'Operador Alojamientos', 'Recepción Vehículos', 'Operador']; }
+    function isSeller() { return isActive() && role() in ['seller', 'seller_all', 'seller_lodging', 'Vendedor', 'Vendedor Renta Car y Alojamientos', 'Vendedor Alojamientos']; }
+    function canOperate() { return isAdmin() || isSupervisor() || isOperator() || isSeller() || isMaintenance() || isCleaning(); }
+    function canManageAssets() { return isAdmin() || isSupervisor(); }
+    function canManageInventory() { return isAdmin() || isSupervisor() || isMaintenance(); }
+    function canManageFinance() { return isAdmin() || isSupervisor() || isAccounting(); }
+    function canManageHr() { return isAdmin() || isSupervisor(); }
+
+    function tokenIdFromSubmission() { return request.resource.data.token; }
+    function publicTokenPath(token) { return /databases/$(database)/documents/publicReceptionTokens/$(token); }
+    function validPublicOperationsToken(token) {
+      return token is string
+        && exists(publicTokenPath(token))
+        && get(publicTokenPath(token)).data.active == true
+        && get(publicTokenPath(token)).data.scope == 'public-operations'
+        && get(publicTokenPath(token)).data.expiresAtMs > request.time.toMillis();
+    }
+
+    // Disponibilidad pública iCal: solo bloques sin datos personales.
+    match /publicIcalBlocks/{docId} {
+      allow read: if request.time < timestamp.date(2099, 1, 1);
+      allow create, update: if canOperate();
+      allow delete: if isAdmin();
+    }
+
+    // Tokens públicos: lectura pública solo si el token está activo y vigente.
+    match /publicReceptionTokens/{tokenId} {
+      // V221.19: link corto y seguro. Un tercero solo puede leer un token activo,
+      // de alcance público-operaciones y vigente. No se permite listar tokens.
+      allow get: if resource.data.active == true
+        && resource.data.scope in ['public-operations','operations','logistics','logistica']
+        && (!('expiresAtMs' in resource.data) || resource.data.expiresAtMs > request.time.toMillis());
+      allow list: if false;
+      allow create, update: if isAdmin() || isSupervisor();
+      allow delete: if isAdmin();
+    }
+
+    // Operaciones enviadas desde links públicos seguros.
+    match /publicOperationSubmissions/{submissionId} {
+      allow read: if isActive();
+      allow create, update: if isAdmin() || isSupervisor() || (request.resource.data.publicOrigin == 'public-operations' && validPublicOperationsToken(tokenIdFromSubmission()));
+      allow delete: if isAdmin();
+    }
+
+    // Perfiles de acceso.
+    match /users/{userId} {
+      allow read: if isActive();
+      allow create: if signedIn() && (request.auth.uid == userId || isAdmin());
+      allow update: if isAdmin() || (signedIn() && request.auth.uid == userId && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'permissionsProfile', 'active', 'isActive']));
+      allow delete: if isAdmin();
+    }
+
+    // Auditoría: el sistema puede registrar; solo admin/supervisor consulta o depura.
+    match /auditLogs/{docId} {
+      allow read: if isAdmin() || isSupervisor();
+      allow create: if isActive();
+      allow update, delete: if isAdmin();
+    }
+
+    // Comercial y reservas operativas.
+    match /reservations/{docId} {
+      allow read: if isActive();
+      allow create, update: if canOperate();
+      allow delete: if isAdmin();
+    }
+    match /lodgingReservations/{docId} {
+      allow read: if isActive();
+      allow create, update: if canOperate();
+      allow delete: if isAdmin();
+    }
+    match /clientLeads/{docId} {
+      allow read: if isActive();
+      allow create, update: if canOperate();
+      allow delete: if isAdmin();
+    }
+
+    // Catálogos maestros.
+    match /vehicles/{docId} {
+      allow read: if isActive();
+      allow create, update: if canManageAssets();
+      allow delete: if isAdmin();
+    }
+    match /accommodations/{docId} {
+      allow read: if isActive();
+      allow create, update: if canManageAssets();
+      allow delete: if isAdmin();
+    }
+
+    // Operaciones de vehículos.
+    match /vehicleCheckins/{docId} {
+      allow read: if isActive();
+      allow create, update: if canOperate();
+      allow delete: if isAdmin();
+    }
+
+    // Inventario.
+    match /inventoryItems/{docId} {
+      allow read: if isActive();
+      allow create, update: if canManageInventory();
+      allow delete: if isAdmin();
+    }
+    match /inventoryMovements/{docId} {
+      allow read: if isActive();
+      allow create, update: if canManageInventory();
+      allow delete: if isAdmin();
+    }
+
+    // Administración financiera: gastos, caja derivada, compra/venta de divisas.
+    match /generalExpenses/{docId} {
+      allow read: if isActive();
+      allow create, update: if canManageFinance();
+      allow delete: if isAdmin();
+    }
+    match /dollarPurchases/{docId} {
+      allow read: if isActive();
+      allow create, update: if canManageFinance();
+      allow delete: if isAdmin();
+    }
+
+    // RRHH.
+    match /hrPeople/{docId} {
+      allow read: if isActive();
+      allow create, update: if canManageHr();
+      allow delete: if isAdmin();
+    }
+    match /hrTasks/{docId} {
+      allow read: if isActive();
+      allow create, update: if isAdmin() || isSupervisor() || isOperator() || isMaintenance() || isCleaning();
+      allow delete: if isAdmin() || isSupervisor();
+    }
+
+    // Fallback seguro: cualquier colección nueva queda en solo lectura para usuarios activos
+    // y requiere admin para escrituras hasta crear una regla explícita en una versión futura.
+    match /{collectionId}/{document=**} {
+      allow read: if isActive();
+      allow create, update, delete: if isAdmin();
+    }
+  }
+}

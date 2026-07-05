@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.DS_Store
+.vercel/
+package-lock.json
+npm-shrinkwrap.json
+node_modules/
+dist/
+.vercel/
+package-lock.json
+npm-shrinkwrap.json

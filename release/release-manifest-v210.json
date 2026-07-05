@@ -1,0 +1,27 @@
+{
+  "version": "1.0.210",
+  "name": "V210 DevOps / CI-CD / Gobernanza",
+  "baseline": "V209 estable desplegada",
+  "scope": [
+    "Automatización CI/CD",
+    "Release candidate manual",
+    "Checklist GO/NO-GO de congelamiento",
+    "Gobernanza de tags Git"
+  ],
+  "untouched": [
+    "src/App.jsx",
+    "caja",
+    "renta car",
+    "calendario",
+    "PDF",
+    "iCal",
+    "Firebase rules",
+    "inventario",
+    "RRHH",
+    "ROI"
+  ],
+  "validation": [
+    "npm run production:check",
+    "npm run build"
+  ]
+}

@@ -966,11 +966,14 @@ function ensurePrintableOverlayMessageBridge() {
   return
 }
 
-if (event.data?.type === 'alohandote:close-document-preview') {
+    if (event.data?.type === 'alohandote:close-document-preview') {
   closePrintableOverlay()
   window.focus()
   return
 }
+if (event.data?.type === 'alohandote:share-pdf-blob' || event.data?.type === 'alohandote:share-pdf-buffer') {
+
+  try {
         const blob = event.data?.type === 'alohandote:share-pdf-buffer'
           ? new Blob([event.data?.buffer], { type: event.data?.mimeType || 'application/pdf' })
           : event.data?.blob
@@ -998,10 +1001,6 @@ if (event.data?.type === 'alohandote:close-document-preview') {
         console.warn('No se pudo compartir el PDF desde la app principal:', err)
       }
       return
-    }
-    if (event.data?.type === 'alohandote:close-document-preview' || event.data?.type === 'alohandote:return-to-form') {
-      closePrintableOverlay()
-      window.focus()
     }
   })
 }

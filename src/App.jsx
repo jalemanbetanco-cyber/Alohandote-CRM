@@ -1581,12 +1581,22 @@ export default function App() {
       setUser(currentUser)
       if (!currentUser) { setProfile(null); setAuthLoading(false); clearTimeout(safetyTimer); return }
       const defaultProfile = {
-        uid: currentUser.uid,
-        email: currentUser.email,
-        name: currentUser.displayName || currentUser.email?.split('@')[0] || 'Usuario',
-        role: adminEmails.includes(currentUser.email?.toLowerCase()) ? 'admin' : '',
-        active: true,
+      uid: currentUser.uid,
+      email: currentUser.email,
+      name: currentUser.displayName || currentUser.email?.split('@')[0] || 'Usuario',
+      role: adminEmails.includes(currentUser.email?.toLowerCase()) ? 'admin' : '',
+      active: true,
       }
+
+      const isAdminEmail = adminEmails.includes(currentUser.email?.toLowerCase())
+
+      if (isAdminEmail) {
+      setProfile(defaultProfile)
+      setAuthLoading(false)
+      clearTimeout(safetyTimer)
+      return
+      }
+      
       try {
         const profileSnap = await Promise.race([
           getDoc(doc(db, 'users', currentUser.uid)),

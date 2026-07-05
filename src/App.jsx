@@ -817,39 +817,59 @@ async function buildAlohandoteCleanPdfBlob(){
   var previousBodyBg=document.body.style.background;
   if(actions) actions.style.display='none';
   document.body.style.background='#ffffff';
-  const previousZoom = document.body.style.zoom;
-  const previousOverflow = document.body.style.overflow;
 
-  document.body.style.zoom = '1';
-  document.body.style.overflow = 'hidden';
-
-  document.documentElement.style.width = '794px';
-  document.body.style.width = '794px';
-
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-  var stableWidth='794px';
   var pageNodes=Array.from(document.querySelectorAll('.page'));
-  var targetNodes=pageNodes.length ? pageNodes : [document.querySelector('.phone-sheet,.sheet,.receipt') || document.body];
+  var originalNodes=pageNodes.length ? pageNodes : [document.querySelector('.phone-sheet,.sheet,.receipt') || document.body];
+
   var pdf=new jspdf.jsPDF('p','mm','a4');
   var first=true;
-  for(var i=0;i<targetNodes.length;i++){
-    var node=targetNodes[i];
-    var isContractPage=node.classList && node.classList.contains('page');
-    var options=isContractPage
-      ? {cssWidth:stableWidth,pixelWidth:794,minHeight:'1123px'}
-      : {cssWidth:'760px',pixelWidth:760,minHeight:''};
-    var canvas=await captureAlohandoteNode(node, options);
-    if(!first) pdf.addPage('a4','p');
-    addCanvasToPdfInPages(pdf, canvas, 210, 297, isContractPage ? 0 : 6);
-    first=false;
-  }
-  if(actions) actions.style.display='';
-  document.body.style.background=previousBodyBg||'';
-  document.documentElement.style.width = '';
-  document.body.style.width = '';
 
-  document.body.style.zoom = previousZoom;
-  document.body.style.overflow = previousOverflow;
+  var sandbox=document.createElement('div');
+  sandbox.setAttribute('data-alohandote-pdf-sandbox','true');
+  sandbox.style.position='fixed';
+  sandbox.style.left='-10000px';
+  sandbox.style.top='0';
+  sandbox.style.width='794px';
+  sandbox.style.background='#ffffff';
+  sandbox.style.zIndex='-1';
+  sandbox.style.overflow='visible';
+  document.body.appendChild(sandbox);
+
+  try{
+    for(var i=0;i<originalNodes.length;i++){
+      var original=originalNodes[i];
+      var isContractPage=original.classList && original.classList.contains('page');
+
+      var clone=original.cloneNode(true);
+      clone.style.width=isContractPage ? '794px' : '760px';
+      clone.style.minWidth=isContractPage ? '794px' : '760px';
+      clone.style.maxWidth=isContractPage ? '794px' : '760px';
+      clone.style.margin='0 auto';
+      clone.style.transform='none';
+      clone.style.zoom='1';
+      clone.style.background='#ffffff';
+
+      sandbox.innerHTML='';
+      sandbox.appendChild(clone);
+
+      await new Promise(r=>setTimeout(r,350));
+
+      var options=isContractPage
+        ? {cssWidth:'794px',pixelWidth:794,minHeight:'1123px'}
+        : {cssWidth:'760px',pixelWidth:760,minHeight:''};
+
+      var canvas=await captureAlohandoteNode(clone, options);
+
+      if(!first) pdf.addPage('a4','p');
+      addCanvasToPdfInPages(pdf, canvas, 210, 297, isContractPage ? 0 : 6);
+      first=false;
+    }
+  } finally {
+    sandbox.remove();
+    if(actions) actions.style.display='';
+    document.body.style.background=previousBodyBg||'';
+  }
+
   return pdf.output('blob');
 }
 async function downloadAlohandoteCleanPdf(){

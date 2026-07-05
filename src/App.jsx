@@ -1341,7 +1341,7 @@ function normalizeRole(value) {
   if (['mantenimiento', 'maintenance'].includes(raw)) return 'maintenance'
   if (['contabilidad', 'contador', 'administracion', 'administración', 'accounting'].includes(raw)) return 'accounting'
   if (['solo lectura', 'lector', 'read only', 'readonly'].includes(raw)) return 'readonly'
-  return 'seller'
+  return raw ? 'seller' : ''
 }
 const ROLE_LABELS = {
   admin: 'Administrador',
@@ -1574,10 +1574,10 @@ export default function App() {
   useEffect(() => {
     if (publicReceptionMode || publicOperationsMode || !isFirebaseReady || !auth) { setAuthLoading(false); return }
     const safetyTimer = setTimeout(() => {
-      console.warn('Auth validation timeout: showing login/app fallback')
-      setAuthLoading(false)
-    }, 8000)
+    console.warn('Auth validation timeout: keeping protected app blocked until profile resolves')
+    }, 12000)
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setAuthLoading(true)
       setUser(currentUser)
       if (!currentUser) { setProfile(null); setAuthLoading(false); clearTimeout(safetyTimer); return }
       const defaultProfile = {

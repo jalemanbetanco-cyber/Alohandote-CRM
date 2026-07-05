@@ -1587,16 +1587,10 @@ export default function App() {
       role: adminEmails.includes(currentUser.email?.toLowerCase()) ? 'admin' : '',
       active: true,
       }
-
-      const isAdminEmail = adminEmails.includes(currentUser.email?.toLowerCase())
-
-      if (isAdminEmail) {
-      setProfile(defaultProfile)
+      const safetyTimer = setTimeout(() => {
+      console.warn('Auth validation timeout: showing login/app fallback')
       setAuthLoading(false)
-      clearTimeout(safetyTimer)
-      return
-      }
-      
+      }, 8000)
       try {
         const profileSnap = await Promise.race([
           getDoc(doc(db, 'users', currentUser.uid)),

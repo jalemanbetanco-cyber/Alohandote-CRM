@@ -813,6 +813,65 @@ function addCanvasToPdfInPages(pdf, canvas, pageW, pageH, margin){
   }
 }
 async function buildAlohandoteCleanPdfBlob(){
+  var page=document.querySelector('.page');
+
+  // Contrato: PDF A4 real por texto, no captura de pantalla
+  if(page){
+    var pdf=new jspdf.jsPDF('p','mm','a4');
+    var margin=18;
+    var pageW=210;
+    var pageH=297;
+    var usableW=pageW-(margin*2);
+    var y=18;
+
+    function addPageIfNeeded(extra){
+      if(y+extra>pageH-18){
+        pdf.addPage();
+        y=18;
+      }
+    }
+
+    function addText(text,size,bold,align){
+      text=String(text||'').replace(/\s+/g,' ').trim();
+      if(!text) return;
+      pdf.setFont('times',bold?'bold':'normal');
+      pdf.setFontSize(size||11);
+      var lines=pdf.splitTextToSize(text,usableW);
+      var lineH=(size||11)*0.42;
+      addPageIfNeeded(lines.length*lineH+4);
+      if(align==='center'){
+        lines.forEach(function(line){
+          pdf.text(line,pageW/2,y,{align:'center'});
+          y+=lineH;
+        });
+      }else{
+        pdf.text(lines,margin,y);
+        y+=lines.length*lineH;
+      }
+      y+=3;
+    }
+
+    addText(document.querySelector('.title')?.textContent || document.title,12,true,'center');
+
+    var paragraphs=Array.from(page.querySelectorAll('p'));
+    paragraphs.forEach(function(p){
+      addText(p.textContent,10.5,false);
+    });
+
+    y+=12;
+    addPageIfNeeded(35);
+    pdf.setFont('times','normal');
+    pdf.setFontSize(10);
+    pdf.line(25,y,85,y);
+    pdf.line(125,y,185,y);
+    y+=6;
+    pdf.text('EL ARRENDADOR',55,y,{align:'center'});
+    pdf.text('EL ARRENDATARIO',155,y,{align:'center'});
+
+    return pdf.output('blob');
+  }
+
+  // Otros documentos: se mantiene flujo anterior
   var actions=document.querySelector('.actions');
   var previousBodyBg=document.body.style.background;
   if(actions) actions.style.display='none';
@@ -824,52 +883,16 @@ async function buildAlohandoteCleanPdfBlob(){
   var pdf=new jspdf.jsPDF('p','mm','a4');
   var first=true;
 
-  var sandbox=document.createElement('div');
-  sandbox.setAttribute('data-alohandote-pdf-sandbox','true');
-  sandbox.style.position='fixed';
-  sandbox.style.left='-10000px';
-  sandbox.style.top='0';
-  sandbox.style.width='794px';
-  sandbox.style.background='#ffffff';
-  sandbox.style.zIndex='-1';
-  sandbox.style.overflow='visible';
-  document.body.appendChild(sandbox);
-
-  try{
-    for(var i=0;i<originalNodes.length;i++){
-      var original=originalNodes[i];
-      var isContractPage=original.classList && original.classList.contains('page');
-
-      var clone=original.cloneNode(true);
-      clone.style.width=isContractPage ? '794px' : '760px';
-      clone.style.minWidth=isContractPage ? '794px' : '760px';
-      clone.style.maxWidth=isContractPage ? '794px' : '760px';
-      clone.style.margin='0 auto';
-      clone.style.transform='none';
-      clone.style.zoom='1';
-      clone.style.background='#ffffff';
-
-      sandbox.innerHTML='';
-      sandbox.appendChild(clone);
-
-      await new Promise(r=>setTimeout(r,350));
-
-      var options=isContractPage
-        ? {cssWidth:'794px',pixelWidth:794,minHeight:'1123px'}
-        : {cssWidth:'760px',pixelWidth:760,minHeight:''};
-
-      var canvas=await captureAlohandoteNode(clone, options);
-
-      if(!first) pdf.addPage('a4','p');
-      addCanvasToPdfInPages(pdf, canvas, 210, 297, isContractPage ? 0 : 6);
-      first=false;
-    }
-  } finally {
-    sandbox.remove();
-    if(actions) actions.style.display='';
-    document.body.style.background=previousBodyBg||'';
+  for(var i=0;i<originalNodes.length;i++){
+    var node=originalNodes[i];
+    var canvas=await captureAlohandoteNode(node,{cssWidth:'760px',pixelWidth:760,minHeight:''});
+    if(!first) pdf.addPage('a4','p');
+    addCanvasToPdfInPages(pdf,canvas,210,297,6);
+    first=false;
   }
 
+  if(actions) actions.style.display='';
+  document.body.style.background=previousBodyBg||'';
   return pdf.output('blob');
 }
 async function downloadAlohandoteCleanPdf(){
@@ -6400,7 +6423,7 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
     const clientDocumentLabel = clientIdType === 'E' ? 'documento de identidad extranjero' : 'cédula de identidad'
     const clientCi = reservation.customerId ? `${clientIdType}-${String(reservation.customerId).replace(/^[VE]-/i,'')}` : '________________'
     const brand = vehicle.brand || vehicle.name || '__________'
-    const html = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=794, initial-scale=1, maximum-scale=1, user-scalable=no"/><title>Contrato${escapeHtml(clientName)}</title><style>${cleanPrintCss}@page{size:A4;margin:0}.page{page-break-inside:auto}*{box-sizing:border-box}html,body{width:794px;min-width:794px;margin:0 auto;padding:0;background:#eee;overflow-x:hidden}body{font-family:'Times New Roman',serif;color:#111}.actions{text-align:center;margin:18px}.actions button{background:#ff385c;color:white;border:0;border-radius:999px;padding:12px 20px;font-weight:bold;margin:4px}.actions button.secondary{background:#222}.page{width:794px;min-width:794px;max-width:794px;min-height:1123px;background:white;margin:0 auto 24px;padding:49px 53px 45px 53px;line-height:1.19;font-size:12.2px;text-align:justify;position:relative}.lawyer-sign{position:absolute;top:7mm;left:12mm;width:38mm;height:auto}.title{text-align:center;font-weight:bold;font-size:15.5px;margin:20mm 0 12px;text-transform:uppercase}.clause{margin:8px 0}.signatures{display:grid;grid-template-columns:1fr 1fr;gap:42px;text-align:center;margin-top:55px}.line{border-top:1px solid #111;padding-top:8px}.small{font-size:13px}.upper{text-transform:uppercase}@media print{body{background:white}.actions{display:none}.page{margin:0;width:auto;min-height:auto;box-shadow:none}}</style></head><body><div class="actions">${pdfActionButtons(cleanDocumentFileName('Contrato renta car', reservation.customerName))}</div><main class="page"><img class="lawyer-sign" src="/firma-abogado.png" alt="Firma abogado"/><div class="title">CONTRATO PRIVADO DE ARRENDAMIENTO DE VEHÍCULO AUTOMOTOR</div><p>Entre, <strong>${landlordName}</strong>, venezolano, mayor de edad, titular de la cédula de identidad Nº <strong>V-20.634.357</strong>, domiciliado en la ciudad de Lechería, municipio Diego Bautista Urbaneja del estado Anzoátegui, teléfono 0424-8639102, quien a los efectos del presente contrato se denominará <strong>EL ARRENDADOR</strong>, por una parte; y por la otra, <strong>${escapeHtml(clientName)}</strong>, ${escapeHtml(clientNationalityText)}, mayor de edad, titular del ${escapeHtml(clientDocumentLabel)} Nº <strong>${escapeHtml(clientCi)}</strong>, domiciliado(a) en <strong>${escapeHtml(reservation.customerAddress || '________________________')}</strong>, quien en lo adelante y a los efectos del presente contrato se denominará <strong>EL ARRENDATARIO</strong>; se ha convenido en celebrar el presente contrato privado de arrendamiento de vehículo automotor, el cual se regirá por las disposiciones aplicables del Código Civil venezolano, por las normas de tránsito y circulación vigentes, por las condiciones particulares aquí establecidas y en base a las siguientes cláusulas:</p><p class="clause"><strong>PRIMERA:</strong> EL ARRENDADOR da en arrendamiento a EL ARRENDATARIO un (1) vehículo automotor de su exclusiva administración, identificado de la siguiente manera: marca <strong>${escapeHtml(upper(brand))}</strong>, modelo <strong>${escapeHtml(upper(vehicle.model || '__________'))}</strong>, año <strong>${escapeHtml(vehicle.year || '__________')}</strong>, color <strong>${escapeHtml(upper(vehicle.color || '__________'))}</strong>, placa <strong>${escapeHtml(upper(vehicle.plate || '__________'))}</strong>, serial de carrocería (VIN) <strong>${escapeHtml(upper(vehicle.vin || '__________'))}</strong>, con kilometraje aproximado de entrega de <strong>${escapeHtml(reservation.deliveryKm || vehicle.currentKm || '__________')} Km</strong>, el cual se entrega con sus documentos de circulación, llave principal, caucho de repuesto, herramientas básicas y demás accesorios disponibles.</p><p class="clause"><strong>SEGUNDA:</strong> EL ARRENDATARIO destinará el vehículo arrendado única y exclusivamente para uso particular, personal y lícito, quedando terminantemente prohibido darle un uso distinto al aquí establecido, así como emplearlo para transporte público o privado remunerado de pasajeros, transporte de carga no autorizada, competencias, remolque, aprendizaje de conducción, actividades ilícitas o cualquier otra finalidad que implique un riesgo mayor al uso normal y prudente del vehículo.</p><p class="clause"><strong>TERCERA:</strong> El plazo de duración del presente contrato será de <strong>${days}</strong> día(s) continuos, contados a partir del día <strong>${escapeHtml(start)}</strong> a las <strong>${escapeHtml(reservation.deliveryTime || '12:00')}</strong>, hasta el día <strong>${escapeHtml(end)}</strong> a las <strong>${escapeHtml(reservation.returnTime || '12:00')}</strong>. Cualquier prórroga deberá ser autorizada previamente por EL ARRENDADOR y constar por escrito, por mensaje verificable o por cualquier medio de comunicación que permita dejar constancia de la aceptación de ambas partes.</p><p class="clause"><strong>CUARTA:</strong> El canon de arrendamiento del presente contrato es la cantidad de <strong>${money(total)}</strong> por el período antes indicado. EL ARRENDATARIO pagará dicho canon a EL ARRENDADOR conforme a las condiciones comerciales acordadas entre las partes, dejando ambas partes constancia del monto total del servicio contratado.</p><p class="clause"><strong>QUINTA:</strong> EL ARRENDATARIO entrega a EL ARRENDADOR la cantidad de <strong>${money(deposit)}</strong> por concepto de depósito en garantía, destinado a asegurar el exacto cumplimiento de las obligaciones asumidas en el presente contrato, incluyendo, entre otras, daños al vehículo, exceso de kilometraje, multas, combustible faltante, retraso en la devolución, pérdida de documentos, llaves o accesorios y cualquier otro incumplimiento imputable a EL ARRENDATARIO. Dicho depósito será reintegrado total o parcialmente al momento de la devolución del vehículo, una vez efectuada la revisión correspondiente.</p><p class="clause"><strong>SEXTA:</strong> En caso de accidente, colisión, avería grave, hurto, robo, intento de robo, inmovilización, retención por autoridad competente o cualquier siniestro que afecte el vehículo, EL ARRENDATARIO deberá notificar de inmediato a EL ARRENDADOR, dar aviso a la autoridad correspondiente cuando sea procedente, abstenerse de abandonar el vehículo sin resguardo y cooperar plenamente con los trámites policiales, administrativos y de seguro.</p><p class="clause"><strong>SÉPTIMA:</strong> EL ARRENDATARIO se obliga a devolver el vehículo en la fecha y hora convenidas, en el mismo lugar de entrega o en el que indique EL ARRENDADOR, con el mismo nivel de combustible con que lo recibe, junto con sus documentos, llaves, accesorios y demás implementos.</p><p class="clause"><strong>OCTAVA:</strong> El incumplimiento por parte de EL ARRENDATARIO de una cualquiera de las obligaciones contenidas en el presente contrato dará derecho a EL ARRENDADOR a exigir la resolución inmediata del mismo o su cumplimiento forzoso, en ambos casos con daños y perjuicios, sin menoscabo de las demás acciones civiles, penales, administrativas o de cualquier otra naturaleza a que hubiere lugar conforme a derecho.</p><p>Se hacen dos (2) ejemplares de un mismo tenor y a un solo efecto, en <strong>${escapeHtml(city)}</strong>, a la fecha de entrega del vehículo: <strong>${escapeHtml(deliveryDate)}</strong>.</p><div class="signatures"><div><div class="line"><strong>${landlordName}</strong><br>EL ARRENDADOR<br>C.I. V-20.634.357</div></div><div><div class="line"><strong>${escapeHtml(clientName)}</strong><br>EL ARRENDATARIO<br>${escapeHtml(clientIdType === 'E' ? 'Doc. extranjero' : 'C.I.')} ${escapeHtml(clientCi)}</div></div></div></main></body></html>`
+    const html = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=794, initial-scale=1, maximum-scale=1, user-scalable=no"/><title>Contrato${escapeHtml(clientName)}</title><style>${cleanPrintCss}@page{size:A4;margin:0}.page{page-break-inside:auto}*{box-sizing:border-box}html,body{width:794px;min-width:794px;margin:0 auto;padding:0;background:#eee;overflow-x:hidden}body{font-family:'Times New Roman',serif;color:#111}.actions{text-align:center;margin:18px}.actions button{background:#ff385c;color:white;border:0;border-radius:999px;padding:12px 20px;font-weight:bold;margin:4px}.actions button.secondary{background:#222}.page{width:210mm;min-height:297mm;background:white;margin:0 auto 24px;padding:13mm 14mm 12mm 14mm;line-height:1.19;font-size:12.2px;text-align:justify;position:relative}.lawyer-sign{position:absolute;top:7mm;left:12mm;width:38mm;height:auto}.title{text-align:center;font-weight:bold;font-size:15.5px;margin:20mm 0 12px;text-transform:uppercase}.clause{margin:8px 0}.signatures{display:grid;grid-template-columns:1fr 1fr;gap:42px;text-align:center;margin-top:55px}.line{border-top:1px solid #111;padding-top:8px}.small{font-size:13px}.upper{text-transform:uppercase}@media print{body{background:white}.actions{display:none}.page{margin:0;width:auto;min-height:auto;box-shadow:none}}</style></head><body><div class="actions">${pdfActionButtons(cleanDocumentFileName('Contrato renta car', reservation.customerName))}</div><main class="page"><img class="lawyer-sign" src="/firma-abogado.png" alt="Firma abogado"/><div class="title">CONTRATO PRIVADO DE ARRENDAMIENTO DE VEHÍCULO AUTOMOTOR</div><p>Entre, <strong>${landlordName}</strong>, venezolano, mayor de edad, titular de la cédula de identidad Nº <strong>V-20.634.357</strong>, domiciliado en la ciudad de Lechería, municipio Diego Bautista Urbaneja del estado Anzoátegui, teléfono 0424-8639102, quien a los efectos del presente contrato se denominará <strong>EL ARRENDADOR</strong>, por una parte; y por la otra, <strong>${escapeHtml(clientName)}</strong>, ${escapeHtml(clientNationalityText)}, mayor de edad, titular del ${escapeHtml(clientDocumentLabel)} Nº <strong>${escapeHtml(clientCi)}</strong>, domiciliado(a) en <strong>${escapeHtml(reservation.customerAddress || '________________________')}</strong>, quien en lo adelante y a los efectos del presente contrato se denominará <strong>EL ARRENDATARIO</strong>; se ha convenido en celebrar el presente contrato privado de arrendamiento de vehículo automotor, el cual se regirá por las disposiciones aplicables del Código Civil venezolano, por las normas de tránsito y circulación vigentes, por las condiciones particulares aquí establecidas y en base a las siguientes cláusulas:</p><p class="clause"><strong>PRIMERA:</strong> EL ARRENDADOR da en arrendamiento a EL ARRENDATARIO un (1) vehículo automotor de su exclusiva administración, identificado de la siguiente manera: marca <strong>${escapeHtml(upper(brand))}</strong>, modelo <strong>${escapeHtml(upper(vehicle.model || '__________'))}</strong>, año <strong>${escapeHtml(vehicle.year || '__________')}</strong>, color <strong>${escapeHtml(upper(vehicle.color || '__________'))}</strong>, placa <strong>${escapeHtml(upper(vehicle.plate || '__________'))}</strong>, serial de carrocería (VIN) <strong>${escapeHtml(upper(vehicle.vin || '__________'))}</strong>, con kilometraje aproximado de entrega de <strong>${escapeHtml(reservation.deliveryKm || vehicle.currentKm || '__________')} Km</strong>, el cual se entrega con sus documentos de circulación, llave principal, caucho de repuesto, herramientas básicas y demás accesorios disponibles.</p><p class="clause"><strong>SEGUNDA:</strong> EL ARRENDATARIO destinará el vehículo arrendado única y exclusivamente para uso particular, personal y lícito, quedando terminantemente prohibido darle un uso distinto al aquí establecido, así como emplearlo para transporte público o privado remunerado de pasajeros, transporte de carga no autorizada, competencias, remolque, aprendizaje de conducción, actividades ilícitas o cualquier otra finalidad que implique un riesgo mayor al uso normal y prudente del vehículo.</p><p class="clause"><strong>TERCERA:</strong> El plazo de duración del presente contrato será de <strong>${days}</strong> día(s) continuos, contados a partir del día <strong>${escapeHtml(start)}</strong> a las <strong>${escapeHtml(reservation.deliveryTime || '12:00')}</strong>, hasta el día <strong>${escapeHtml(end)}</strong> a las <strong>${escapeHtml(reservation.returnTime || '12:00')}</strong>. Cualquier prórroga deberá ser autorizada previamente por EL ARRENDADOR y constar por escrito, por mensaje verificable o por cualquier medio de comunicación que permita dejar constancia de la aceptación de ambas partes.</p><p class="clause"><strong>CUARTA:</strong> El canon de arrendamiento del presente contrato es la cantidad de <strong>${money(total)}</strong> por el período antes indicado. EL ARRENDATARIO pagará dicho canon a EL ARRENDADOR conforme a las condiciones comerciales acordadas entre las partes, dejando ambas partes constancia del monto total del servicio contratado.</p><p class="clause"><strong>QUINTA:</strong> EL ARRENDATARIO entrega a EL ARRENDADOR la cantidad de <strong>${money(deposit)}</strong> por concepto de depósito en garantía, destinado a asegurar el exacto cumplimiento de las obligaciones asumidas en el presente contrato, incluyendo, entre otras, daños al vehículo, exceso de kilometraje, multas, combustible faltante, retraso en la devolución, pérdida de documentos, llaves o accesorios y cualquier otro incumplimiento imputable a EL ARRENDATARIO. Dicho depósito será reintegrado total o parcialmente al momento de la devolución del vehículo, una vez efectuada la revisión correspondiente.</p><p class="clause"><strong>SEXTA:</strong> En caso de accidente, colisión, avería grave, hurto, robo, intento de robo, inmovilización, retención por autoridad competente o cualquier siniestro que afecte el vehículo, EL ARRENDATARIO deberá notificar de inmediato a EL ARRENDADOR, dar aviso a la autoridad correspondiente cuando sea procedente, abstenerse de abandonar el vehículo sin resguardo y cooperar plenamente con los trámites policiales, administrativos y de seguro.</p><p class="clause"><strong>SÉPTIMA:</strong> EL ARRENDATARIO se obliga a devolver el vehículo en la fecha y hora convenidas, en el mismo lugar de entrega o en el que indique EL ARRENDADOR, con el mismo nivel de combustible con que lo recibe, junto con sus documentos, llaves, accesorios y demás implementos.</p><p class="clause"><strong>OCTAVA:</strong> El incumplimiento por parte de EL ARRENDATARIO de una cualquiera de las obligaciones contenidas en el presente contrato dará derecho a EL ARRENDADOR a exigir la resolución inmediata del mismo o su cumplimiento forzoso, en ambos casos con daños y perjuicios, sin menoscabo de las demás acciones civiles, penales, administrativas o de cualquier otra naturaleza a que hubiere lugar conforme a derecho.</p><p>Se hacen dos (2) ejemplares de un mismo tenor y a un solo efecto, en <strong>${escapeHtml(city)}</strong>, a la fecha de entrega del vehículo: <strong>${escapeHtml(deliveryDate)}</strong>.</p><div class="signatures"><div><div class="line"><strong>${landlordName}</strong><br>EL ARRENDADOR<br>C.I. V-20.634.357</div></div><div><div class="line"><strong>${escapeHtml(clientName)}</strong><br>EL ARRENDATARIO<br>${escapeHtml(clientIdType === 'E' ? 'Doc. extranjero' : 'C.I.')} ${escapeHtml(clientCi)}</div></div></div></main></body></html>`
     writePrintableWindow(printWindow, html, cleanDocumentFileName('Contrato renta car', reservation.customerName))
     showSuccess('Contrato generado correctamente')
   }

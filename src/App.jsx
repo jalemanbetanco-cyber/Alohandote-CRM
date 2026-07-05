@@ -819,9 +819,9 @@ async function buildAlohandoteCleanPdfBlob(){
   if(page){
   var pdf=new jspdf.jsPDF('p','mm','a4');
   var pageW=210, pageH=297;
-  var margin=10;
+  var margin=14;
   var usableW=pageW-(margin*2);
-  var y=12;
+  var y=18;
 
   async function addImageIfExists(src,x,y,w,h){
     try{
@@ -839,7 +839,7 @@ async function buildAlohandoteCleanPdfBlob(){
     pdf.setFont('times',bold?'bold':'normal');
     pdf.setFontSize(size||8.7);
     var lines=pdf.splitTextToSize(text,usableW);
-    var lineH=(size||8.7)*0.34;
+    var lineH=(size||9.4)*0.38;
     if(align==='center'){
       lines.forEach(function(line){
         pdf.text(line,pageW/2,y,{align:'center'});
@@ -852,15 +852,15 @@ async function buildAlohandoteCleanPdfBlob(){
     y+=1.6;
   }
 
-  await addImageIfExists('/firma-abogado.png',10,5,26,14);
+  await addImageIfExists('/firma-abogado.png',14,7,28,15);
 
   y=10;
-  addText(document.querySelector('.title')?.textContent || document.title,9.5,true,'center');
+  addText(document.querySelector('.title')?.textContent || document.title,11,true,'center');
   y+=2;
 
   var paragraphs=Array.from(page.querySelectorAll('p'));
   paragraphs.forEach(function(p){
-    addText(p.textContent,8.5,false);
+    addText(p.textContent,9.4,false);
   });
 
   y=Math.min(y+6,258);

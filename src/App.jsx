@@ -763,7 +763,20 @@ async function captureAlohandoteNode(node, options){
   var rect=node.getBoundingClientRect();
   var captureWidth=Math.ceil(Math.max(node.scrollWidth,rect.width,options.pixelWidth));
   var captureHeight=Math.ceil(Math.max(node.scrollHeight,rect.height));
-  var canvas=await html2canvas(node,{scale:2,backgroundColor:'#ffffff',useCORS:true,allowTaint:true,scrollX:0,scrollY:0,windowWidth:captureWidth,windowHeight:captureHeight});
+  window.scrollTo(0,0);
+  document.body.style.overflow='hidden';
+  await new Promise(r=>setTimeout(r,250));
+  var canvas=await html2canvas(node,
+  {scale:3,
+  backgroundColor:'#ffffff',
+  useCORS:true,
+  logging:false,
+  scrollX:0,
+  scrollY:0,
+  windowWidth:captureWidth,
+  windowHeight:captureHeight
+});
+  document.body.style.overflow='';
   restoreAlohandotePdfTarget(node, previous);
   return canvas;
 }

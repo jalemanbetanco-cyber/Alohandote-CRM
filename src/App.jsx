@@ -921,13 +921,17 @@ async function shareAlohandoteCleanPdf(){
     const file=new File([blob],fileName,{type:'application/pdf'});
     if(navigator.canShare && navigator.canShare({files:[file]})){
       await navigator.share({files:[file],title:fileName});
-      try{ if(window.parent && window.parent!==window){ window.parent.postMessage({type:'alohandote:close-document-preview',source:'document-preview'}, window.location.origin); } }catch(_close){}
+      try{
+        if(window.parent && window.parent!==window){
+        window.parent.postMessage({type:'alohandote:return-to-form',source:'document-preview'}, window.location.origin);
+        }
+      }catch(_close){}
       return;
     }
     if(window.parent && window.parent !== window){
       try{
         const buffer=await blob.arrayBuffer();
-        window.parent.postMessage({type:'alohandote:share-pdf-buffer',source:'document-preview',fileName,buffer,mimeType:'application/pdf'}, window.location.origin, [buffer]);
+        window.parent.postMessage({type:'alohandote:return-to-form',source:'document-preview'}, window.location.origin);
         return;
       }catch(_a){
         try{ window.parent.postMessage({type:'alohandote:share-pdf-blob',source:'document-preview',fileName,blob}, window.location.origin); return; }catch(_b){}
@@ -956,8 +960,17 @@ function ensurePrintableOverlayMessageBridge() {
   window.__alohandotePrintableBridgeReady = true
   window.addEventListener('message', async (event) => {
     if (event.origin !== window.location.origin) return
-    if (event.data?.type === 'alohandote:share-pdf-blob' || event.data?.type === 'alohandote:share-pdf-buffer') {
-      try {
+    if (event.data?.type === 'alohandote:return-to-form') {
+  closePrintableOverlay()
+  window.focus()
+  return
+}
+
+if (event.data?.type === 'alohandote:close-document-preview') {
+  closePrintableOverlay()
+  window.focus()
+  return
+}
         const blob = event.data?.type === 'alohandote:share-pdf-buffer'
           ? new Blob([event.data?.buffer], { type: event.data?.mimeType || 'application/pdf' })
           : event.data?.blob

@@ -817,60 +817,63 @@ async function buildAlohandoteCleanPdfBlob(){
 
   // Contrato: PDF A4 real por texto, no captura de pantalla
   if(page){
-    var pdf=new jspdf.jsPDF('p','mm','a4');
-    var margin=18;
-    var pageW=210;
-    var pageH=297;
-    var usableW=pageW-(margin*2);
-    var y=18;
+  var pdf=new jspdf.jsPDF('p','mm','a4');
+  var pageW=210, pageH=297;
+  var margin=10;
+  var usableW=pageW-(margin*2);
+  var y=12;
 
-    function addPageIfNeeded(extra){
-      if(y+extra>pageH-18){
-        pdf.addPage();
-        y=18;
-      }
-    }
-
-    function addText(text,size,bold,align){
-      text=String(text||'').replace(/\s+/g,' ').trim();
-      if(!text) return;
-      pdf.setFont('times',bold?'bold':'normal');
-      pdf.setFontSize(size||11);
-      var lines=pdf.splitTextToSize(text,usableW);
-      var lineH=(size||11)*0.42;
-      addPageIfNeeded(lines.length*lineH+4);
-      if(align==='center'){
-        lines.forEach(function(line){
-          pdf.text(line,pageW/2,y,{align:'center'});
-          y+=lineH;
-        });
-      }else{
-        pdf.text(lines,margin,y);
-        y+=lines.length*lineH;
-      }
-      y+=3;
-    }
-
-    addText(document.querySelector('.title')?.textContent || document.title,12,true,'center');
-
-    var paragraphs=Array.from(page.querySelectorAll('p'));
-    paragraphs.forEach(function(p){
-      addText(p.textContent,10.5,false);
-    });
-
-    y+=12;
-    addPageIfNeeded(35);
-    pdf.setFont('times','normal');
-    pdf.setFontSize(10);
-    pdf.line(25,y,85,y);
-    pdf.line(125,y,185,y);
-    y+=6;
-    pdf.text('EL ARRENDADOR',55,y,{align:'center'});
-    pdf.text('EL ARRENDATARIO',155,y,{align:'center'});
-
-    return pdf.output('blob');
+  async function addImageIfExists(src,x,y,w,h){
+    try{
+      var img=new Image();
+      img.crossOrigin='anonymous';
+      img.src=src;
+      await new Promise((res,rej)=>{img.onload=res;img.onerror=rej;});
+      pdf.addImage(img,'PNG',x,y,w,h);
+    }catch(_e){}
   }
 
+  function addText(text,size,bold,align){
+    text=String(text||'').replace(/\s+/g,' ').trim();
+    if(!text)return;
+    pdf.setFont('times',bold?'bold':'normal');
+    pdf.setFontSize(size||8.7);
+    var lines=pdf.splitTextToSize(text,usableW);
+    var lineH=(size||8.7)*0.34;
+    if(align==='center'){
+      lines.forEach(function(line){
+        pdf.text(line,pageW/2,y,{align:'center'});
+        y+=lineH;
+      });
+    }else{
+      pdf.text(lines,margin,y);
+      y+=lines.length*lineH;
+    }
+    y+=1.6;
+  }
+
+  await addImageIfExists('/firma-abogado.png',10,5,26,14);
+
+  y=10;
+  addText(document.querySelector('.title')?.textContent || document.title,9.5,true,'center');
+  y+=2;
+
+  var paragraphs=Array.from(page.querySelectorAll('p'));
+  paragraphs.forEach(function(p){
+    addText(p.textContent,8.5,false);
+  });
+
+  y=Math.min(y+6,258);
+  pdf.setFont('times','normal');
+  pdf.setFontSize(8.5);
+  pdf.line(25,y,85,y);
+  pdf.line(125,y,185,y);
+  y+=5;
+  pdf.text('EL ARRENDADOR',55,y,{align:'center'});
+  pdf.text('EL ARRENDATARIO',155,y,{align:'center'});
+
+  return pdf.output('blob');
+}
   // Otros documentos: se mantiene flujo anterior
   var actions=document.querySelector('.actions');
   var previousBodyBg=document.body.style.background;

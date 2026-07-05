@@ -44,6 +44,9 @@ export function fieldValue(fields = {}, key) {
 }
 
 export function isImportedIcalFields(fields = {}) {
+  // Hotfix iCal export: no excluir reservas internas solo porque el canal diga Airbnb/Booking.
+  // Una reserva creada manualmente en Alohandote puede venir del canal Airbnb y debe exportarse
+  // como bloqueo público. Solo se excluyen registros importados realmente desde iCal externo.
   const source = String(fieldValue(fields, 'source') || '').toLowerCase()
   const sourceType = String(fieldValue(fields, 'sourceType') || '').toLowerCase()
   const icalSourceKey = String(fieldValue(fields, 'icalSourceKey') || '')

@@ -99,10 +99,14 @@ export async function buildLodgingIcalBody(rawAccommodationId) {
 
   const docs = await fetchLodgingIcalDocuments()
   const events = []
-  for (const doc of docs) {
-    const fields = doc.fields || {}
-    if (String(fieldValue(fields, 'accommodationId')) !== accommodationId) continue
-    if (isImportedIcalFields(fields)) continue
+for (const doc of docs) {
+  const fields = doc.fields || {}
+  if (String(fieldValue(fields, 'accommodationId')) !== accommodationId) continue
+  const isPublicIcalBlock = String(doc.name || '').includes('/publicIcalBlocks/')
+
+// Si ya viene de publicIcalBlocks, NO volver a filtrarlo como importado.
+// Esa colección ya es la colección pública que Airbnb debe leer.
+if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
 
     const status = String(fieldValue(fields, 'status') || 'reserved').toLowerCase()
     if (['cancelled', 'canceled', 'cancelada', 'anulada'].includes(status)) continue

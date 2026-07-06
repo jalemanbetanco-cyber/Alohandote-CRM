@@ -116,6 +116,7 @@ export async function buildLodgingIcalBody(rawAccommodationId) {
     const start = String(fieldValue(fields, 'startDate') || '').slice(0, 10)
     const rawEnd = String(fieldValue(fields, 'endDate') || '').slice(0, 10)
     const end = normalizeExclusiveEndDate(start, rawEnd)
+
     if (!start || !end) continue
 
     if (status === 'maintenance' && calendarDurationDays(start, rawEnd || start) <= 1) continue
@@ -134,21 +135,21 @@ export async function buildLodgingIcalBody(rawAccommodationId) {
       'END:VEVENT',
     ].join('\r\n'))
   }
+
   if (!events.length) {
-    // Algunos importadores externos rechazan feeds completamente vacíos.
-    // Evento histórico inocuo: no bloquea disponibilidad futura.
     events.push([
       'BEGIN:VEVENT',
-      `UID:alohandote-empty-feed-${escapeIcal(accommodationId)}@alohandote-rent-calendar`,
-      `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')}`,
+      UID:alohandote-empty-feed-${escapeIcal(accommodationId)}@alohandote-rent-calendar,
+      DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')},
       'DTSTART;VALUE=DATE:20000101',
       'DTEND;VALUE=DATE:20000102',
-      'SUMMARY:Reserved',
+      'SUMMARY:Not available',
+      'STATUS:CONFIRMED',
+      'TRANSP:OPAQUE',
       'END:VEVENT',
     ].join('\r\n'))
   }
-  // V187: feed minimalista para máxima compatibilidad Airbnb/Estei.
-  // Algunos importadores rechazan propiedades opcionales aunque el .ics sea válido.
+
   return [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
@@ -159,7 +160,6 @@ export async function buildLodgingIcalBody(rawAccommodationId) {
     '',
   ].join('\r\n')
 }
-
 export async function sendLodgingIcal(req, res, rawAccommodationId) {
   try {
     const accommodationId = safeSlug(rawAccommodationId)

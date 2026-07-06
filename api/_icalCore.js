@@ -97,69 +97,43 @@ export async function buildLodgingIcalBody(rawAccommodationId) {
   const accommodationId = safeSlug(rawAccommodationId)
   if (!accommodationId) throw new Error('Missing accommodationId')
 
-let totalDocs = 0
-let matchedAccommodation = 0
-let skippedDifferentAccommodation = 0
-let skippedImported = 0
-let skippedCancelled = 0
-let skippedNoDates = 0
-let skippedShortMaintenance = 0
-for (const doc of docs) {
-  totalDocs += 1
-const fields = doc.fields || {}
-const docAccommodationId = String(fieldValue(fields, 'accommodationId') || '')
+  const docs = await fetchLodgingIcalDocuments()
+  const events = []
 
-if (docAccommodationId !== accommodationId) {
-  skippedDifferentAccommodation += 1
-  continue
-}
+  for (const doc of docs) {
+    const fields = doc.fields || {}
+    const docAccommodationId = String(fieldValue(fields, 'accommodationId') || '')
 
-matchedAccommodation += 1
+    if (docAccommodationId !== accommodationId) continue
 
-const isPublicIcalBlock = String(doc.name || '').includes('/publicIcalBlocks/')
+    const isPublicIcalBlock = String(doc.name || '').includes('/publicIcalBlocks/')
 
-// Los publicIcalBlocks son la fuente oficial para Airbnb.
-// Nunca deben excluirse por source, channel, externalUid ni texto Airbnb.
-if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
-  skippedImported += 1
-  continue
-}
-// Si ya viene de publicIcalBlocks, NO volver a filtrarlo como importado.
-// Esa colección ya es la colección pública que Airbnb debe leer.
-if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
+    if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
 
     const status = String(fieldValue(fields, 'status') || 'reserved').toLowerCase()
-    if (['cancelled', 'canceled', 'cancelada', 'anulada'].includes(status)) {
-    skippedCancelled += 1
-    continue
-}
+    if (['cancelled', 'canceled', 'cancelada', 'anulada'].includes(status)) continue
+
     const start = String(fieldValue(fields, 'startDate') || '').slice(0, 10)
     const rawEnd = String(fieldValue(fields, 'endDate') || '').slice(0, 10)
     const end = normalizeExclusiveEndDate(start, rawEnd)
-    if (!start || !end) {
-    skippedNoDates += 1
-    continue
-}
-    if (status === 'maintenance' && calendarDurationDays(start, rawEnd || start) <= 1) {
-    skippedShortMaintenance += 1
-    continue
-}
+    if (!start || !end) continue
 
-    const summary = status === 'maintenance' ? 'Mantenimiento' : 'No disponible'
-    const id = doc.name?.split('/').pop() || `${accommodationId}-${start}-${end}`
+    if (status === 'maintenance' && calendarDurationDays(start, rawEnd || start) <= 1) continue
+
+    const id = doc.name?.split('/').pop() || ${accommodationId}-${start}-${end}
+
     events.push([
       'BEGIN:VEVENT',
-      `UID:${escapeIcal(id)}@alohandote-rent-calendar`,
-      `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')}`,
-      `DTSTART;VALUE=DATE:${formatDate(start)}`,
-      `DTEND;VALUE=DATE:${formatDate(end)}`,
+      UID:${escapeIcal(id)}@alohandote-rent-calendar,
+      DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')},
+      DTSTART;VALUE=DATE:${formatDate(start)},
+      DTEND;VALUE=DATE:${formatDate(end)},
       'SUMMARY:Not available',
       'STATUS:CONFIRMED',
       'TRANSP:OPAQUE',
       'END:VEVENT',
     ].join('\r\n'))
   }
-
   if (!events.length) {
     // Algunos importadores externos rechazan feeds completamente vacíos.
     // Evento histórico inocuo: no bloquea disponibilidad futura.

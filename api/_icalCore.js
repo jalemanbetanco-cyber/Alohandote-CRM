@@ -45,19 +45,13 @@ export function fieldValue(fields = {}, key) {
 
 export function isImportedIcalFields(fields = {}) {
   const source = String(fieldValue(fields, 'source') || '').toLowerCase()
-  const sourceType = String(fieldValue(fields, 'sourceType') || '').toLowerCase()
-  const icalSourceKey = String(fieldValue(fields, 'icalSourceKey') || '')
-  const icalSourceUrl = String(fieldValue(fields, 'icalSourceUrl') || '')
+  const channel = String(fieldValue(fields, 'channel') || '').toLowerCase()
+  const note = String(fieldValue(fields, 'note') || fieldValue(fields, 'notes') || '').toLowerCase()
+  const customer = String(fieldValue(fields, 'customerName') || '').toLowerCase()
   const externalUid = String(fieldValue(fields, 'externalUid') || '')
-
-  return (
-    source === 'ical' ||
-    sourceType === 'ical' ||
-    Boolean(icalSourceKey) ||
-    Boolean(icalSourceUrl) ||
-    Boolean(externalUid)
-  )
+  return source === 'ical' || channel.includes('ical') || channel.includes('airbnb') || channel.includes('booking') || note.includes('ical') || note.includes('airbnb') || note.includes('booking') || customer.includes('airbnb') || customer.includes('not available') || Boolean(externalUid)
 }
+
 export async function fetchAllDocuments(collectionName) {
   const docs = []
   let pageToken = ''
@@ -99,57 +93,53 @@ export async function buildLodgingIcalBody(rawAccommodationId) {
 
   const docs = await fetchLodgingIcalDocuments()
   const events = []
-
   for (const doc of docs) {
     const fields = doc.fields || {}
-    const docAccommodationId = String(fieldValue(fields, 'accommodationId') || '')
+    if (String(fieldValue(fields, 'accommodationId')) !== accommodationId) continue
 
-    if (docAccommodationId !== accommodationId) continue
+  const isPublicIcalBlock = String(doc.name || '').includes('/publicIcalBlocks/')
 
-    const isPublicIcalBlock = String(doc.name || '').includes('/publicIcalBlocks/')
-
-    if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
-
+// Si viene de publicIcalBlocks, debe exportarse siempre.
+// Esa colección ya es la fuente pública que Airbnb debe leer.
+if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
     const status = String(fieldValue(fields, 'status') || 'reserved').toLowerCase()
     if (['cancelled', 'canceled', 'cancelada', 'anulada'].includes(status)) continue
 
     const start = String(fieldValue(fields, 'startDate') || '').slice(0, 10)
     const rawEnd = String(fieldValue(fields, 'endDate') || '').slice(0, 10)
     const end = normalizeExclusiveEndDate(start, rawEnd)
-
     if (!start || !end) continue
-
     if (status === 'maintenance' && calendarDurationDays(start, rawEnd || start) <= 1) continue
 
-    const id = doc.name?.split('/').pop() || ${accommodationId}-${start}-${end}
-
+    const summary = status === 'maintenance' ? 'Mantenimiento' : 'No disponible'
+    const id = doc.name?.split('/').pop() || `${accommodationId}-${start}-${end}`
     events.push([
       'BEGIN:VEVENT',
-      UID:${escapeIcal(id)}@alohandote-rent-calendar,
-      DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')},
-      DTSTART;VALUE=DATE:${formatDate(start)},
-      DTEND;VALUE=DATE:${formatDate(end)},
-      'SUMMARY:Not available',
-      'STATUS:CONFIRMED',
-      'TRANSP:OPAQUE',
+      `UID:${escapeIcal(id)}@alohandote-rent-calendar`,
+      `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')}`,
+      `DTSTART;VALUE=DATE:${formatDate(start)}`,
+      `DTEND;VALUE=DATE:${formatDate(end)}`,
+      'SUMMARY:Reserved',
       'END:VEVENT',
     ].join('\r\n'))
   }
 
   if (!events.length) {
+    // Algunos importadores externos rechazan feeds completamente vacíos.
+    // Evento histórico inocuo: no bloquea disponibilidad futura.
     events.push([
       'BEGIN:VEVENT',
-      UID:alohandote-empty-feed-${escapeIcal(accommodationId)}@alohandote-rent-calendar,
-      DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')},
+      `UID:alohandote-empty-feed-${escapeIcal(accommodationId)}@alohandote-rent-calendar`,
+      `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')}`,
       'DTSTART;VALUE=DATE:20000101',
       'DTEND;VALUE=DATE:20000102',
-      'SUMMARY:Not available',
-      'STATUS:CONFIRMED',
-      'TRANSP:OPAQUE',
+      'SUMMARY:Reserved',
       'END:VEVENT',
     ].join('\r\n'))
   }
 
+  // V187: feed minimalista para máxima compatibilidad Airbnb/Estei.
+  // Algunos importadores rechazan propiedades opcionales aunque el .ics sea válido.
   return [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
@@ -160,6 +150,7 @@ export async function buildLodgingIcalBody(rawAccommodationId) {
     '',
   ].join('\r\n')
 }
+
 export async function sendLodgingIcal(req, res, rawAccommodationId) {
   try {
     const accommodationId = safeSlug(rawAccommodationId)

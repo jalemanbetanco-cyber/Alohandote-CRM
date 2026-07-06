@@ -1857,10 +1857,10 @@ export default function App() {
   }
   async function logout() { if (auth) await signOut(auth) }
 
-  const canUseCloudData = publicReceptionMode || publicOperationsMode || enableDemoMode || (Boolean(user) && Boolean(profile?.role))
-  const vehiclesStore = useFirestoreOrLocalStorage('vehicles', INITIAL_VEHICLES, canUseCloudData)
+  const canUseCloudData = publicReceptionMode || publicOperationsMode || enableDemoMode || (Boolean(user) && Boolean(profile?.role) && !authLoading)
+  const vehiclesStore = useFirestoreOrLocalStorage('vehicles', [], canUseCloudData)
   const reservationsStore = useFirestoreOrLocalStorage('reservations', [], canUseCloudData)
-  const accommodationsStore = useFirestoreOrLocalStorage('accommodations', INITIAL_ACCOMMODATIONS, canUseCloudData)
+  const accommodationsStore = useFirestoreOrLocalStorage('accommodations', [], canUseCloudData)
   const lodgingStore = useFirestoreOrLocalStorage('lodgingReservations', [], canUseCloudData)
 
   // V183: export público iCal seguro. Airbnb/Booking leen una URL pública,
@@ -2350,9 +2350,9 @@ export default function App() {
     })
   }, [exchangeAdjustmentPercent])
 
-  const vehicles = vehiclesStore.items.length ? vehiclesStore.items : INITIAL_VEHICLES
+  const vehicles = vehiclesStore.items
   const selectedVehicle = vehicles.find((vehicle) => vehicle.id === selectedVehicleId) || null
-  const accommodations = accommodationsStore.items.length ? accommodationsStore.items : INITIAL_ACCOMMODATIONS
+  const accommodations = accommodationsStore.items
   const selectedAccommodation = accommodations.find((item) => item.id === selectedAccommodationId) || null
 
   function reservationKmDriven(reservation) {
@@ -6556,7 +6556,16 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
     else if (operation.reservationType === 'lodging' && operation.operation === 'reception') openCleaningForm(operation)
   }, [publicOperationsMode, publicTaskId, publicTokenRecord, operationsHandoverRows, editingVehicleDelivery, editingVehicleCheckin, editingCleaningTask])
 
-  if (authLoading || (user && !profile?.role)) return <main className="login-shell"><section className="login-card"><h1>Cargando...</h1><p>Validando sesión y datos del sistema.</p></section></main>
+  if (authLoading || (user && !profile?.role)) {
+    return (
+      <main className="login-shell">
+        <section className="login-card">
+          <h1>Cargando...</h1>
+          <p>Validando sesión y datos del sistema.</p>
+        </section>
+      </main>
+    )
+  }
   if (!isFirebaseReady && !enableDemoMode && !publicReceptionMode && !publicOperationsMode) return <FirebaseSetupRequired />
   if (isFirebaseReady && !user && !publicReceptionMode && !publicOperationsMode) return <LoginScreen onLogin={login} loading={loginLoading} error={loginError} />
 

@@ -45,13 +45,19 @@ export function fieldValue(fields = {}, key) {
 
 export function isImportedIcalFields(fields = {}) {
   const source = String(fieldValue(fields, 'source') || '').toLowerCase()
-  const channel = String(fieldValue(fields, 'channel') || '').toLowerCase()
-  const note = String(fieldValue(fields, 'note') || fieldValue(fields, 'notes') || '').toLowerCase()
-  const customer = String(fieldValue(fields, 'customerName') || '').toLowerCase()
+  const sourceType = String(fieldValue(fields, 'sourceType') || '').toLowerCase()
+  const icalSourceKey = String(fieldValue(fields, 'icalSourceKey') || '')
+  const icalSourceUrl = String(fieldValue(fields, 'icalSourceUrl') || '')
   const externalUid = String(fieldValue(fields, 'externalUid') || '')
-  return source === 'ical' || channel.includes('ical') || channel.includes('airbnb') || channel.includes('booking') || note.includes('ical') || note.includes('airbnb') || note.includes('booking') || customer.includes('airbnb') || customer.includes('not available') || Boolean(externalUid)
-}
 
+  return (
+    source === 'ical' ||
+    sourceType === 'ical' ||
+    Boolean(icalSourceKey) ||
+    Boolean(icalSourceUrl) ||
+    Boolean(externalUid)
+  )
+}
 export async function fetchAllDocuments(collectionName) {
   const docs = []
   let pageToken = ''

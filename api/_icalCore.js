@@ -97,25 +97,51 @@ export async function buildLodgingIcalBody(rawAccommodationId) {
   const accommodationId = safeSlug(rawAccommodationId)
   if (!accommodationId) throw new Error('Missing accommodationId')
 
-  const docs = await fetchLodgingIcalDocuments()
-  const events = []
+let totalDocs = 0
+let matchedAccommodation = 0
+let skippedDifferentAccommodation = 0
+let skippedImported = 0
+let skippedCancelled = 0
+let skippedNoDates = 0
+let skippedShortMaintenance = 0
 for (const doc of docs) {
-  const fields = doc.fields || {}
-  if (String(fieldValue(fields, 'accommodationId')) !== accommodationId) continue
-  const isPublicIcalBlock = String(doc.name || '').includes('/publicIcalBlocks/')
+  totalDocs += 1
+const fields = doc.fields || {}
+const docAccommodationId = String(fieldValue(fields, 'accommodationId') || '')
 
+if (docAccommodationId !== accommodationId) {
+  skippedDifferentAccommodation += 1
+  continue
+}
+
+matchedAccommodation += 1
+
+const isPublicIcalBlock = String(doc.name || '').includes('/publicIcalBlocks/')
+
+if (!isPublicIcalBlock && isImportedIcalFields(fields)) {
+  skippedImported += 1
+  continue
+}
 // Si ya viene de publicIcalBlocks, NO volver a filtrarlo como importado.
 // Esa colección ya es la colección pública que Airbnb debe leer.
 if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
 
     const status = String(fieldValue(fields, 'status') || 'reserved').toLowerCase()
-    if (['cancelled', 'canceled', 'cancelada', 'anulada'].includes(status)) continue
-
+    if (['cancelled', 'canceled', 'cancelada', 'anulada'].includes(status)) {
+    skippedCancelled += 1
+    continue
+}
     const start = String(fieldValue(fields, 'startDate') || '').slice(0, 10)
     const rawEnd = String(fieldValue(fields, 'endDate') || '').slice(0, 10)
     const end = normalizeExclusiveEndDate(start, rawEnd)
-    if (!start || !end) continue
-    if (status === 'maintenance' && calendarDurationDays(start, rawEnd || start) <= 1) continue
+    if (!start || !end) {
+    skippedNoDates += 1
+    continue
+}
+    if (status === 'maintenance' && calendarDurationDays(start, rawEnd || start) <= 1) {
+    skippedShortMaintenance += 1
+    continue
+}
 
     const summary = status === 'maintenance' ? 'Mantenimiento' : 'No disponible'
     const id = doc.name?.split('/').pop() || `${accommodationId}-${start}-${end}`
@@ -143,7 +169,17 @@ if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
       'END:VEVENT',
     ].join('\r\n'))
   }
-
+  console.warn('ICAL_EXPORT_DEBUG', {
+  accommodationId,
+  totalDocs,
+  matchedAccommodation,
+  skippedDifferentAccommodation,
+  skippedImported,
+  skippedCancelled,
+  skippedNoDates,
+  skippedShortMaintenance,
+  exportedEvents: events.length,
+})
   // V187: feed minimalista para máxima compatibilidad Airbnb/Estei.
   // Algunos importadores rechazan propiedades opcionales aunque el .ics sea válido.
   return [

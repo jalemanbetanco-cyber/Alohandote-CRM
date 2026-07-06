@@ -118,7 +118,9 @@ matchedAccommodation += 1
 
 const isPublicIcalBlock = String(doc.name || '').includes('/publicIcalBlocks/')
 
-if (!isPublicIcalBlock && isImportedIcalFields(fields)) {
+// Los publicIcalBlocks son la fuente oficial para Airbnb.
+// Nunca deben excluirse por source, channel, externalUid ni texto Airbnb.
+if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
   skippedImported += 1
   continue
 }
@@ -151,7 +153,9 @@ if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
       `DTSTAMP:${new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')}`,
       `DTSTART;VALUE=DATE:${formatDate(start)}`,
       `DTEND;VALUE=DATE:${formatDate(end)}`,
-      'SUMMARY:Reserved',
+      'SUMMARY:Not available',
+      'STATUS:CONFIRMED',
+      'TRANSP:OPAQUE',
       'END:VEVENT',
     ].join('\r\n'))
   }
@@ -169,17 +173,6 @@ if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
       'END:VEVENT',
     ].join('\r\n'))
   }
-  console.warn('ICAL_EXPORT_DEBUG', {
-  accommodationId,
-  totalDocs,
-  matchedAccommodation,
-  skippedDifferentAccommodation,
-  skippedImported,
-  skippedCancelled,
-  skippedNoDates,
-  skippedShortMaintenance,
-  exportedEvents: events.length,
-})
   // V187: feed minimalista para máxima compatibilidad Airbnb/Estei.
   // Algunos importadores rechazan propiedades opcionales aunque el .ics sea válido.
   return [

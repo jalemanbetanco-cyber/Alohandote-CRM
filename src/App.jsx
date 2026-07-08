@@ -1887,25 +1887,42 @@ export default function App() {
   }
 
 
-  // V184: antes de copiar/probar iCal, reparamos la colección pública mínima.
-  // Airbnb/Booking no pueden leer datos privados con login; solo leen publicIcalBlocks.
-  // Esta sincronización NO toca reservas, caja, pagos ni datos personales.
-  async function syncPublicIcalBlocksForAccommodation(apt = selectedAccommodation) {
+  // V223.5.2.11: reconstrucción limpia de export iCal.
+  // Airbnb/Estei leen publicIcalBlocks; por eso esta función funciona como espejo:
+  // 1) elimina exportaciones públicas antiguas del alojamiento;
+  // 2) vuelve a publicar SOLO reservas internas vigentes de Alohandote;
+  // 3) nunca exporta bloqueos importados desde Airbnb/Estei para evitar rebotes.
+  async function syncPublicIcalBlocksForAccommodation(apt = selectedAccommodation, extraRows = []) {
     if (!isFirebaseReady || !db || !apt?.id) return 0
-    const rows = (lodgingStore.items || []).filter((row) => String(row.accommodationId || '') === String(apt.id || ''))
+    const accommodationId = String(apt.id || '')
+
+    try {
+      const snapshot = await getDocs(query(collection(db, 'publicIcalBlocks'), where('accommodationId', '==', accommodationId)))
+      for (const publicDoc of snapshot.docs) {
+        await deleteDoc(doc(db, 'publicIcalBlocks', publicDoc.id))
+      }
+    } catch (err) {
+      console.warn('No se pudo limpiar publicIcalBlocks antes de reconstruir:', err?.message || err)
+    }
+
+    const rowMap = new Map()
+    for (const row of [...(lodgingStore.items || []), ...(Array.isArray(extraRows) ? extraRows : [])]) {
+      if (String(row?.accommodationId || '') !== accommodationId) continue
+      const rowId = row.id || row.__docId || ''
+      if (!rowId) continue
+      rowMap.set(String(rowId), { ...row, id: rowId })
+    }
+    const rows = Array.from(rowMap.values())
     let exported = 0
     for (const row of rows) {
-      const id = row.id || ''
+      const id = row.id || row.__docId || ''
       if (!id) continue
       const status = normalizeStatus(row.status)
       const cancelled = ['cancelled', 'canceled', 'cancelada', 'anulada'].includes(String(status || '').toLowerCase())
       const imported = isIcalImportedBlock(row)
       const shortMaintenance = status === 'maintenance' && isNonBlockingShortMaintenance(row)
-      if (cancelled || imported || shortMaintenance || !row.startDate || !row.endDate) {
-        await removePublicIcalBlock(id)
-        continue
-      }
-      await upsertPublicIcalBlock({ ...row, id, accommodationId: apt.id })
+      if (cancelled || imported || shortMaintenance || !row.startDate || !row.endDate) continue
+      await upsertPublicIcalBlock({ ...row, id, accommodationId })
       exported += 1
     }
     return exported
@@ -4276,15 +4293,13 @@ ${noteLine}`.trim(),
       if (existingPayable?.id) await generalExpensesStore.editItem(existingPayable.id, { ...existingPayable, ...payablePayload })
       else await generalExpensesStore.createItem(payablePayload)
     }
-    // V192: export iCal de salida inmediato.
-    // Cada reserva interna de Alohandote actualiza la colección pública que leen Airbnb/Estei.
-    // No toca caja, pagos ni importaciones iCal externas.
-    await upsertPublicIcalBlock(savedRecord)
+    // V223.5.2.11: después de guardar, reconstruimos el feed público completo del alojamiento.
+    // Esto evita bloqueos viejos o faltantes en Airbnb/Estei y mantiene registros limpios.
     try {
       const aptForExport = accommodations.find((apt) => String(apt.id || '') === String(savedRecord.accommodationId || '')) || selectedAccommodation
-      if (aptForExport?.id) await syncPublicIcalBlocksForAccommodation(aptForExport)
+      if (aptForExport?.id) await syncPublicIcalBlocksForAccommodation(aptForExport, [savedRecord])
     } catch (err) {
-      console.warn('No se pudo refrescar export iCal público después de guardar reserva:', err?.message || err)
+      console.warn('No se pudo reconstruir export iCal público después de guardar reserva:', err?.message || err)
     }
     if (status === 'maintenance') await autoConsumeInventoryForMaintenance(savedRecord, 'Alojamientos')
     if (status === 'reserved') {
@@ -4495,89 +4510,63 @@ ${noteLine}`.trim(),
 
   async function reconcileIcalEventsForAccommodation(targetAccommodation, fetchedCalendars = []) {
     if (!targetAccommodation?.id) return { created: 0, updated: 0, removed: 0, unchanged: 0, totalExternal: 0 }
+    const accommodationId = String(targetAccommodation.id || '')
     const externalEvents = []
-    const sourceKeys = []
+
     for (const calendar of fetchedCalendars) {
-      const sourceKey = `${targetAccommodation.id}-ical-${calendar.host}`
-      sourceKeys.push(sourceKey)
+      const sourceKey = `${accommodationId}-ical-${calendar.host || calendar.index || 'external'}`
       externalEvents.push(...parseIcsEventsForAccommodation(calendar.rawText, {
         key: sourceKey,
         url: calendar.url,
         label: calendar.label
       }, targetAccommodation))
     }
-    const uniqueExternal = new Map()
-    for (const event of externalEvents) uniqueExternal.set(event.externalUid, event)
 
-    const importedForSyncedSources = lodgingStore.items.filter((item) =>
-      item.accommodationId === targetAccommodation.id &&
-      isIcalImportedBlock(item) &&
-      sourceKeys.includes(item.icalSourceKey || '')
-    )
-    const existingByExternalUid = new Map()
-    for (const item of importedForSyncedSources) {
-      if (item.externalUid && !existingByExternalUid.has(item.externalUid)) existingByExternalUid.set(item.externalUid, item)
+    const uniqueExternal = new Map()
+    for (const event of externalEvents) {
+      if (!event?.externalUid || !event.startDate || !event.endDate) continue
+      uniqueExternal.set(event.externalUid, event)
     }
 
-    let created = 0
-    let updated = 0
-    let removed = 0
-    let unchanged = 0
+    // Reconciliación tipo Airbnb/Estei: el feed externo es la fuente de verdad.
+    // Primero limpiamos TODOS los bloqueos iCal importados de este alojamiento y luego
+    // recreamos únicamente los eventos que siguen existiendo en el feed actual.
+    const importedForAccommodation = lodgingStore.items.filter((item) =>
+      String(item.accommodationId || '') === accommodationId && isIcalImportedBlock(item)
+    )
 
-    for (const item of importedForSyncedSources) {
-      if (!item.externalUid || !uniqueExternal.has(item.externalUid)) {
+    let removed = 0
+    for (const item of importedForAccommodation) {
+      if (item?.id) {
         await lodgingStore.removeItem(item.id)
         removed += 1
       }
     }
 
+    let created = 0
     for (const event of uniqueExternal.values()) {
-      const existing = existingByExternalUid.get(event.externalUid)
-      if (existing?.id) {
-        const patch = {
-          ...existing,
-          startDate: event.startDate,
-          endDate: event.endDate,
-          customerName: event.summary,
-          channel: event.sourceLabel,
-          source: 'ical',
-          sourceType: 'ical',
-          icalSourceKey: event.sourceKey,
-          icalSourceUrl: event.sourceUrl,
-          externalUid: event.externalUid,
-          note: `Importado desde ${event.sourceLabel}`,
-          updatedAt: new Date().toISOString()
-        }
-        const changed = existing.startDate !== patch.startDate || existing.endDate !== patch.endDate || existing.customerName !== patch.customerName || existing.icalSourceUrl !== patch.icalSourceUrl
-        if (changed) {
-          await lodgingStore.editItem(existing.id, patch)
-          updated += 1
-        } else {
-          unchanged += 1
-        }
-      } else {
-        await lodgingStore.createItem({
-          ...emptyLodgingReservation(targetAccommodation.id, event.startDate, profile, user),
-          accommodationName: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
-          propertyName: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
-          assetName: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
-          accommodationTitle: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
-          endDate: event.endDate,
-          status: 'reserved',
-          customerName: event.summary,
-          channel: event.sourceLabel,
-          source: 'ical',
-          sourceType: 'ical',
-          icalSourceKey: event.sourceKey,
-          icalSourceUrl: event.sourceUrl,
-          externalUid: event.externalUid,
-          note: `Importado desde ${event.sourceLabel}`
-        })
-        created += 1
-      }
+      await lodgingStore.createItem({
+        ...emptyLodgingReservation(accommodationId, event.startDate, profile, user),
+        accommodationName: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
+        propertyName: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
+        assetName: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
+        accommodationTitle: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
+        endDate: event.endDate,
+        status: 'reserved',
+        customerName: event.summary || 'Reserva iCal',
+        channel: event.sourceLabel || 'iCal externo',
+        source: 'ical',
+        sourceType: 'ical',
+        icalSourceKey: event.sourceKey,
+        icalSourceUrl: event.sourceUrl,
+        externalUid: event.externalUid,
+        note: `Importado desde ${event.sourceLabel || 'iCal externo'}`,
+        updatedAt: new Date().toISOString()
+      })
+      created += 1
     }
 
-    return { created, updated, removed, unchanged, totalExternal: uniqueExternal.size }
+    return { created, updated: 0, removed, unchanged: 0, totalExternal: uniqueExternal.size }
   }
 
   async function importIcsText(rawText, resetExisting = false, sourceInfo = {}) {
@@ -4677,17 +4666,12 @@ ${noteLine}`.trim(),
         fetchedCalendars.push({ index, url: normalizedUrl, rawText, host, label })
       }
 
-      const imported = lodgingStore.items.filter((item) => item.accommodationId === targetAccommodation.id && isIcalImportedBlock(item))
-      const importableEvents = fetchedCalendars.reduce((sum, calendar) => sum + countImportableIcsEvents(calendar.rawText), 0)
-      if (imported.length > 0 && importableEvents === 0) {
-        throw new Error('Los calendarios respondieron, pero no contienen eventos importables. Por seguridad NO se eliminaron los bloqueos iCal actuales ni se desvinculó el calendario.')
-      }
-
       // V221.7: reconciliación real iCal para Airbnb, Estei y cualquier calendario externo.
       // sincronizar solo actualiza bloqueos importados; nunca desvincula URLs iCal.
       // Este botón NO desvincula URLs, pero SÍ compara el feed actual contra los bloqueos iCal guardados
       // para crear, actualizar y liberar fechas cuando el proveedor modifica/cancela reservas.
       const reconcileStats = await reconcileIcalEventsForAccommodation(targetAccommodation, fetchedCalendars)
+      const exportedCount = await syncPublicIcalBlocksForAccommodation(targetAccommodation)
       const preservedUrls = urls.slice(0, 4)
       while (preservedUrls.length < 4) preservedUrls.push('')
       const syncTimestamp = new Date().toISOString()
@@ -4708,7 +4692,7 @@ Eventos externos vigentes: ${reconcileStats.totalExternal}.
 Bloqueos nuevos: ${reconcileStats.created}.
 Bloqueos actualizados: ${reconcileStats.updated}.
 Fechas liberadas/canceladas: ${reconcileStats.removed}.
-Sin cambios: ${reconcileStats.unchanged}.`)
+Reservas propias exportadas hacia Airbnb/Estei: ${exportedCount}.`)
     } catch (err) {
       console.error(err)
       alert(`No se pudo sincronizar uno de los iCal por URL. No se eliminaron los bloqueos anteriores ni se desvinculó el calendario.
@@ -4739,12 +4723,8 @@ Verifica que todos los enlaces iCal guardados respondan correctamente.`)
           const label = host.includes('digitaloceanspaces.com') || host.includes('estei') ? 'Estei' : host.includes('airbnb') ? 'Airbnb' : `iCal ${index}`
           fetchedCalendars.push({ index, url: normalizedUrl, rawText, host, label })
         }
-        const imported = lodgingStore.items.filter((item) => item.accommodationId === apt.id && isIcalImportedBlock(item))
-        const importableEvents = fetchedCalendars.reduce((sum, calendar) => sum + countImportableIcsEvents(calendar.rawText), 0)
-        if (imported.length > 0 && importableEvents === 0) {
-          throw new Error('Sin eventos importables; se conservan bloqueos iCal actuales')
-        }
         await reconcileIcalEventsForAccommodation(apt, fetchedCalendars)
+        await syncPublicIcalBlocksForAccommodation(apt)
         const preservedUrls = urls.slice(0, 4)
         while (preservedUrls.length < 4) preservedUrls.push('')
         await accommodationsStore.editItem(apt.id, {
@@ -5103,20 +5083,46 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
     }) || null
   }
 
-  function vehicleContractAvailableForOperation(operationItem = {}) {
-    const reservation = reservationFromOperationItem(operationItem)
-    return Boolean(reservation?.vehicleId)
+function vehicleContractAvailableForOperation(operationItem = {}) {
+  const reservation = reservationFromOperationItem(operationItem)
+  const vehicleId =
+    reservation?.vehicleId ||
+    operationItem?.vehicleId ||
+    editingVehicleDelivery?.vehicleId ||
+    editingVehicleCheckin?.vehicleId ||
+    ''
+
+  return Boolean(vehicleId)
+}
+
+function printVehicleContractFromOperation(operationItem = {}) {
+  const reservation = reservationFromOperationItem(operationItem) || {}
+  const vehicleId =
+    reservation?.vehicleId ||
+    operationItem?.vehicleId ||
+    editingVehicleDelivery?.vehicleId ||
+    editingVehicleCheckin?.vehicleId ||
+    ''
+
+  if (!vehicleId) {
+    setError('No se encontró el vehículo vinculado para generar el contrato.')
+    return
   }
 
-  function printVehicleContractFromOperation(operationItem = {}) {
-    const reservation = reservationFromOperationItem(operationItem)
-    if (!reservation?.vehicleId) {
-      setError('No se encontró la reserva de Renta Car vinculada para generar el contrato.')
-      return
-    }
-    generateContract(reservation)
-  }
-
+  generateContract({
+    ...operationItem,
+    ...reservation,
+    vehicleId,
+    id: reservation?.id || operationItem?.reservationId || operationItem?.id || '',
+    customerName: reservation?.customerName || operationItem?.customerName || '',
+    phone: reservation?.phone || operationItem?.phone || operationItem?.customerPhone || '',
+    startDate: reservation?.startDate || operationItem?.startDate || operationItem?.operationDate || '',
+    endDate: reservation?.endDate || operationItem?.endDate || operationItem?.returnDate || operationItem?.operationDate || '',
+    deliveryTime: reservation?.deliveryTime || operationItem?.deliveryTime || '12:00',
+    returnTime: reservation?.returnTime || operationItem?.returnTime || '12:00',
+    note: reservation?.note || operationItem?.logisticsNote || operationItem?.note || '',
+  })
+}
   function openVehicleDeliveryForm(operationItem) {
     const vehicle = vehicles.find((item) => item.id === operationItem?.vehicleId) || selectedVehicle || (operationItem?.vehicleId ? { id: operationItem.vehicleId, name: operationItem.assetName || 'Vehículo', currentKm: '' } : null)
     if (!vehicle?.id) return setError('Selecciona primero un vehículo.')
@@ -6657,7 +6663,7 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
           </div>}
           {editingVehicleDelivery && <form className="public-reception-form embedded" onSubmit={saveVehicleDelivery}>
             <h3>Entrega de vehículo</h3>
-            {operationDetailLine(editingVehicleDelivery) && <div className="document-box operation-context"><strong>{editingVehicleDelivery.customerName || 'Cliente'}</strong><small>{operationDetailLine(editingVehicleDelivery)}</small></div>}{editingVehicleDelivery.logisticsNote && <section className="document-box operation-context"><h4>📋 Instrucciones logísticas</h4><p style={{ whiteSpace: 'pre-line', margin: 0 }}>{editingVehicleDelivery.logisticsNote}</p></section>}<label>Responsable de entregar<select value={editingVehicleDelivery.responsible || ''} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, responsible:e.target.value })}>{operationsPeople.map((name)=><option key={name} value={name}>{name}</option>)}</select></label>
+            {operationDetailLine(editingVehicleDelivery) && <div className="document-box operation-context"><strong>{editingVehicleDelivery.customerName || 'Cliente'}</strong><small>{operationDetailLine(editingVehicleDelivery)}</small></div>}<button type="button" className="secondary" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, width: 'fit-content', margin: '10px 0 12px' }} onClick={()=>printVehicleContractFromOperation(editingVehicleDelivery)}><FileText size={17}/> Contrato PDF</button>{editingVehicleDelivery.logisticsNote && <section className="document-box operation-context"><h4>📋 Instrucciones logísticas</h4><p style={{ whiteSpace: 'pre-line', margin: 0 }}>{editingVehicleDelivery.logisticsNote}</p></section>}<label>Responsable de entregar<select value={editingVehicleDelivery.responsible || ''} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, responsible:e.target.value })}>{operationsPeople.map((name)=><option key={name} value={name}>{name}</option>)}</select></label>
             <label>KM salida<input type="number" min="0" value={editingVehicleDelivery.currentKm || ''} placeholder="Ej: 45650" onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, currentKm:e.target.value })}/></label>
             <label>Nivel de combustible<select value={editingVehicleDelivery.fuelLevel || 'Completo'} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, fuelLevel:e.target.value })}><option>Completo</option><option>3/4</option><option>Medio tanque</option><option>1/4</option><option>Bajo</option></select></label>
             <label>Estado general<select value={editingVehicleDelivery.generalStatus || 'Bueno'} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, generalStatus:e.target.value })}><option>Bueno</option><option>Con observación</option><option>Requiere revisión</option></select></label>
@@ -6753,14 +6759,14 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
       {successMessage && <div className="success-toast">{successMessage}</div>}
 
       <nav className="top-module-switch corporate-module-nav" aria-label="Módulos principales">
-        <div className="nav-group nav-group-operation"><span className="nav-group-label">Operación</span>{canViewCars && !isLogistics && <button className={['cars','carDeliveries','carReceptions'].includes(moduleMode) ? 'active' : ''} onClick={() => setModuleMode('cars')}><span className="nav-icon">🚗</span><span>Renta Car</span></button>}{canViewLodging && !isLogistics && <button className={['lodging','lodgingDeliveries','lodgingReceptions'].includes(moduleMode) ? 'active' : ''} onClick={() => setModuleMode('lodging')}><span className="nav-icon">🏠</span><span>Alojamientos</span></button>}{isLogistics && <button className={moduleMode === 'carDeliveries' ? 'active' : ''} onClick={() => setModuleMode('carDeliveries')}><span className="nav-icon">🚗</span><span>Entregas</span></button>}{isLogistics && <button className={moduleMode === 'carReceptions' ? 'active' : ''} onClick={() => setModuleMode('carReceptions')}><span className="nav-icon">🔁</span><span>Recepciones</span></button>}{isLogistics && <button className={moduleMode === 'lodgingReceptions' ? 'active' : ''} onClick={() => setModuleMode('lodgingReceptions')}><span className="nav-icon">🧹</span><span>Check-out / Limpieza</span></button>}{canViewCommercial && <button className={['commercial','quotes','reservations'].includes(moduleMode) ? 'active' : ''} onClick={() => { setModuleMode('commercial'); setSearchMode('quotes') }}><span className="nav-icon">📋</span><span>Comercial</span></button>}</div>
+        <div className="nav-group nav-group-operation"><span className="nav-group-label">Operación</span>{canViewCars && !isLogistics && <button className={['cars','carDeliveries','carReceptions'].includes(moduleMode) ? 'active' : ''} onClick={() => setModuleMode('cars')}><span className="nav-icon">🚗</span><span>Renta Car</span></button>}{canViewLodging && !isLogistics && <button className={['lodging','lodgingDeliveries','lodgingReceptions'].includes(moduleMode) ? 'active' : ''} onClick={() => setModuleMode('lodging')}><span className="nav-icon">🏠</span><span>Alojamientos</span></button>}{isLogistics && <button className={moduleMode === 'carDeliveries' ? 'active' : ''} onClick={() => setModuleMode('carDeliveries')}><span className="nav-icon">🚗</span><span>Entregas</span></button>}{isLogistics && <button className={moduleMode === 'carReceptions' ? 'active' : ''} onClick={() => setModuleMode('carReceptions')}><span className="nav-icon">🚗</span><span>Recepciones</span></button>}{isLogistics && <button className={moduleMode === 'lodgingReceptions' ? 'active' : ''} onClick={() => setModuleMode('lodgingReceptions')}><span className="nav-icon">🧹</span><span>Check-out / Limpieza</span></button>}{canViewCommercial && <button className={['commercial','quotes','reservations'].includes(moduleMode) ? 'active' : ''} onClick={() => { setModuleMode('commercial'); setSearchMode('quotes') }}><span className="nav-icon">📋</span><span>Comercial</span></button>}</div>
         <div className="nav-group nav-group-erp"><span className="nav-group-label">ERP</span>{canViewAdmin && <button className={moduleMode === 'administration' ? 'active' : ''} onClick={() => setModuleMode('administration')}><span className="nav-icon">💼</span><span>Administración ERP</span></button>}{canViewInventory && <button className={moduleMode === 'inventory' ? 'active inventory-tab' : 'inventory-tab'} onClick={() => setModuleMode('inventory')}><span className="nav-icon">📦</span><span>Inventario ERP</span></button>}{canViewHr && <button className={moduleMode === 'hr' ? 'active hr-tab' : 'hr-tab'} onClick={() => setModuleMode('hr')}><span className="nav-icon">👥</span><span>RRHH ERP</span></button>}</div>
         {(canUseMaintenance || canViewProfitability) && <div className="nav-group nav-group-control"><span className="nav-group-label">Control</span>{canUseMaintenance && <button className={moduleMode === 'maintenance' ? 'active' : ''} onClick={() => setModuleMode('maintenance')}><span className="nav-icon">🔧</span><span>Mantenimiento</span></button>}{canViewProfitability && <button className={moduleMode === 'profitability' ? 'active profitability-tab' : 'profitability-tab'} onClick={() => setModuleMode('profitability')}><span className="nav-icon">📈</span><span>Rentabilidad KM / ROI</span></button>}</div>}
       </nav>
 
 
-      {canUseCarLogistics && ['cars','carDeliveries','carReceptions'].includes(moduleMode) && <div className="erp-submodule-switch mobile-top-switch">{!isLogistics && <button className={moduleMode === 'cars' ? 'active' : ''} onClick={() => setModuleMode('cars')}>Calendario Renta Car</button>}<button className={moduleMode === 'carDeliveries' ? 'active' : ''} onClick={() => setModuleMode('carDeliveries')}>Entregas</button><button className={moduleMode === 'carReceptions' ? 'active' : ''} onClick={() => setModuleMode('carReceptions')}>Recepciones</button></div>}
-      {canUseLodgingLogistics && ['lodging','lodgingDeliveries','lodgingReceptions'].includes(moduleMode) && <div className="erp-submodule-switch mobile-top-switch">{!isLogistics && <button className={moduleMode === 'lodging' ? 'active' : ''} onClick={() => setModuleMode('lodging')}>Calendario Alojamientos</button>}{!isLogistics && <button className={moduleMode === 'lodgingDeliveries' ? 'active' : ''} onClick={() => setModuleMode('lodgingDeliveries')}>Check-in</button>}<button className={moduleMode === 'lodgingReceptions' ? 'active' : ''} onClick={() => setModuleMode('lodgingReceptions')}>Check-out / Limpieza</button></div>}
+      {canUseCarLogistics && !isLogistics && ['cars','carDeliveries','carReceptions'].includes(moduleMode) && <div className="erp-submodule-switch mobile-top-switch"><button className={moduleMode === 'cars' ? 'active' : ''} onClick={() => setModuleMode('cars')}>Calendario Renta Car</button><button className={moduleMode === 'carDeliveries' ? 'active' : ''} onClick={() => setModuleMode('carDeliveries')}>Entregas</button><button className={moduleMode === 'carReceptions' ? 'active' : ''} onClick={() => setModuleMode('carReceptions')}>Recepciones</button></div>}
+      {canUseLodgingLogistics && !isLogistics && ['lodging','lodgingDeliveries','lodgingReceptions'].includes(moduleMode) && <div className="erp-submodule-switch mobile-top-switch">{!isLogistics && <button className={moduleMode === 'lodging' ? 'active' : ''} onClick={() => setModuleMode('lodging')}>Calendario Alojamientos</button>}{!isLogistics && <button className={moduleMode === 'lodgingDeliveries' ? 'active' : ''} onClick={() => setModuleMode('lodgingDeliveries')}>Check-in</button>}<button className={moduleMode === 'lodgingReceptions' ? 'active' : ''} onClick={() => setModuleMode('lodgingReceptions')}>Check-out / Limpieza</button></div>}
       {(['commercial','quotes','reservations'].includes(moduleMode)) && <section className="global-search-panel advanced-search">
         <div className="search-mode-tabs"><button className={searchMode === 'quotes' ? 'active' : ''} onClick={() => { setModuleMode('commercial'); setSearchMode('quotes') }}>Cotizaciones</button><button className={searchMode === 'reservations' ? 'active' : ''} onClick={() => { setModuleMode('commercial'); setSearchMode('reservations') }}>Reservas</button></div>
         <div className="search-grid">
@@ -6789,10 +6795,10 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
           const title = reservation ? (normalizeStatus(reservation.status) === 'maintenance' ? 'Mantenimiento' : reservation.customerName || status?.label) : ''
           return <button key={index} className={`day-cell ${!date ? 'muted' : ''} ${status?.className || ''}`} onClick={() => date && (reservation ? openEditReservation(reservation) : openCreateReservation(date))}>{date && <><span className="day-number">{date.getDate()}</span>{reservation ? <span className="reservation-label">{title}</span> : selectedVehicle?.dailyRentalRate ? <span className="day-price">${Number(selectedVehicle.dailyRentalRate || 0).toLocaleString('es-VE', { maximumFractionDigits: 0 })}</span> : null}{reservation?.createdByName && <small className="seller-mini">{reservation.createdByName}</small>}</>}</button>
         })}</div></>}
-      </section> : moduleMode === 'carDeliveries' ? <section className="calendar-panel module-ops-panel"><div className="topbar"><div><span className="eyebrow">Renta Car</span><h2>Entregas de vehículos</h2><p className="vehicle-subtitle">Vehículos que deben ser entregados según la fecha de inicio de cada reserva. Solo admin.</p></div><div className="topbar-actions"><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística</button></div></div><div className="module-ops-grid"><section className="history-list pending-receptions vehicle-delivery-section"><h3>Entregas de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Entrega: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleDeliveryForm(item)}>Abrir entrega</button></div>) : <div className="empty-state">No hay vehículos por entregar hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximas entregas — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Entrega: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleDeliveryForm(item)}>Abrir entrega</button></div>) : <div className="empty-state">No hay entregas próximas.</div>}</section></div></section>
-      : moduleMode === 'carReceptions' ? <section className="calendar-panel module-ops-panel"><div className="topbar"><div><span className="eyebrow">Renta Car</span><h2>Recepciones de vehículos</h2><p className="vehicle-subtitle">Vehículos que deben ser recibidos según la fecha final de cada reserva. Al recibir se actualiza kilometraje y ROI.</p></div><div className="topbar-actions"><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística</button><button className="primary" onClick={() => openVehicleReception(selectedVehicle)}><Plus size={17}/> Nueva recepción</button></div></div><div className="module-ops-grid"><section className="history-list pending-receptions vehicle-reception-section"><h3>Recepciones de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Recepción: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleReceptionForm(item)}>Abrir recepción</button></div>) : <div className="empty-state">No hay vehículos por recibir hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximas recepciones — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Recepción: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleReceptionForm(item)}>Abrir recepción</button></div>) : <div className="empty-state">No hay recepciones próximas.</div>}</section></div><div className="history-list"><h3>Historial de recepción de vehículos</h3>{selectedVehicleCheckins.length ? selectedVehicleCheckins.slice(0, 20).map((item) => <div className="history-row" key={item.id}><div><strong>{Number(item.currentKm || 0).toLocaleString('es-VE')} km</strong><span>{item.vehicleName || selectedVehicle?.name} · {item.fuelLevel || 'Combustible no indicado'} · {item.generalStatus || 'Sin estado'}</span><small>{item.createdAt ? new Date(item.createdAt).toLocaleString('es-VE') : ''} · Recibido por {titleCaseName(item.createdByName || item.createdByEmail || 'Operador')}</small>{item.notes && <p>{item.notes}</p>}</div></div>) : <div className="empty-state">No hay recepciones registradas para este vehículo.</div>}</div></section>
+      </section> : moduleMode === 'carDeliveries' ? <section className="calendar-panel module-ops-panel">{!isLogistics && <div className="topbar"><div><span className="eyebrow">Renta Car</span><h2>Entregas de vehículos</h2><p className="vehicle-subtitle">Vehículos que deben ser entregados según la fecha de inicio de cada reserva. Solo admin.</p></div><div className="topbar-actions"><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística</button></div></div>}<div className="module-ops-grid"><section className="history-list pending-receptions vehicle-delivery-section"><h3>Entregas de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Entrega: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleDeliveryForm(item)}>Abrir entrega</button></div>) : <div className="empty-state">No hay vehículos por entregar hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximas entregas — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Entrega: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleDeliveryForm(item)}>Abrir entrega</button></div>) : <div className="empty-state">No hay entregas próximas.</div>}</section></div></section>
+      : moduleMode === 'carReceptions' ? <section className="calendar-panel module-ops-panel">{!isLogistics && <div className="topbar"><div><span className="eyebrow">Renta Car</span><h2>Recepciones de vehículos</h2><p className="vehicle-subtitle">Vehículos que deben ser recibidos según la fecha final de cada reserva. Al recibir se actualiza kilometraje y ROI.</p></div><div className="topbar-actions"><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística</button><button className="primary" onClick={() => openVehicleReception(selectedVehicle)}><Plus size={17}/> Nueva recepción</button></div></div>}<div className="module-ops-grid"><section className="history-list pending-receptions vehicle-reception-section"><h3>Recepciones de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Recepción: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleReceptionForm(item)}>Abrir recepción</button></div>) : <div className="empty-state">No hay vehículos por recibir hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximas recepciones — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Recepción: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleReceptionForm(item)}>Abrir recepción</button></div>) : <div className="empty-state">No hay recepciones próximas.</div>}</section></div><div className="history-list"><h3>Historial de recepción de vehículos</h3>{selectedVehicleCheckins.length ? selectedVehicleCheckins.slice(0, 20).map((item) => <div className="history-row" key={item.id}><div><strong>{Number(item.currentKm || 0).toLocaleString('es-VE')} km</strong><span>{item.vehicleName || selectedVehicle?.name} · {item.fuelLevel || 'Combustible no indicado'} · {item.generalStatus || 'Sin estado'}</span><small>{item.createdAt ? new Date(item.createdAt).toLocaleString('es-VE') : ''} · Recibido por {titleCaseName(item.createdByName || item.createdByEmail || 'Operador')}</small>{item.notes && <p>{item.notes}</p>}</div></div>) : <div className="empty-state">No hay recepciones registradas para este vehículo.</div>}</div></section>
       : moduleMode === 'lodgingDeliveries' ? <section className="calendar-panel module-ops-panel"><div className="topbar"><div><span className="eyebrow">Alojamientos</span><h2>Check-in / Entregas</h2><p className="vehicle-subtitle">Alojamientos que deben entregarse al huésped según la fecha de inicio. Incluye reservas internas e iCal.</p></div><div className="topbar-actions"><button className="secondary" onClick={repairIcalAccommodationNames}>Reparar nombres iCal</button><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística / limpieza</button></div></div><div className="module-ops-grid"><section className="history-list pending-receptions lodging-delivery-section"><h3>Check-in de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-in: {formatShortDate(item.operationDate)}</span><small>{item.title}{item.sourceType === 'ical' ? ' · Importado por iCal' : ''}</small></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>markHandoverOperationDone(item)}>Check-in realizado</button>}</div>) : <div className="empty-state">No hay alojamientos por entregar hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximos check-in — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-in: {formatShortDate(item.operationDate)}</span></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>markHandoverOperationDone(item)}>Marcar check-in</button>}</div>) : <div className="empty-state">No hay check-in próximos.</div>}</section></div></section>
-      : moduleMode === 'lodgingReceptions' ? <section className="calendar-panel module-ops-panel"><div className="topbar"><div><span className="eyebrow">Alojamientos</span><h2>Check-out / Limpieza</h2><p className="vehicle-subtitle">Alojamientos por recibir según la fecha final. Al marcar limpieza se actualiza el conteo por alojamiento.</p></div><div className="topbar-actions"><button className="secondary" onClick={repairIcalAccommodationNames}>Reparar nombres iCal</button><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link limpieza</button></div></div><div className="module-ops-grid"><section className="history-list pending-receptions lodging-reception-section"><h3>Check-out / limpiezas de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-out: {formatShortDate(item.operationDate)} · Limpiezas: {item.cleaningsCount || 0}</span><small>{item.title}{item.sourceType === 'ical' ? ' · Importado por iCal' : ''}</small></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>openCleaningForm(item)}>Marcar limpieza</button>}</div>) : <div className="empty-state">No hay alojamientos por recibir hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximos check-out — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-out: {formatShortDate(item.operationDate)} · Limpiezas: {item.cleaningsCount || 0}</span></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>openCleaningForm(item)}>Marcar limpieza</button>}</div>) : <div className="empty-state">No hay check-out próximos.</div>}</section></div></section>
+      : moduleMode === 'lodgingReceptions' ? <section className="calendar-panel module-ops-panel">{!isLogistics && <div className="topbar"><div><span className="eyebrow">Alojamientos</span><h2>Check-out / Limpieza</h2><p className="vehicle-subtitle">Alojamientos por recibir según la fecha final. Al marcar limpieza se actualiza el conteo por alojamiento.</p></div><div className="topbar-actions"><button className="secondary" onClick={repairIcalAccommodationNames}>Reparar nombres iCal</button><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link limpieza</button></div></div>}<div className="module-ops-grid"><section className="history-list pending-receptions lodging-reception-section"><h3>Check-out / limpiezas de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-out: {formatShortDate(item.operationDate)} · Limpiezas: {item.cleaningsCount || 0}</span><small>{item.title}{item.sourceType === 'ical' ? ' · Importado por iCal' : ''}</small></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>openCleaningForm(item)}>Marcar limpieza</button>}</div>) : <div className="empty-state">No hay alojamientos por recibir hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximos check-out — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-out: {formatShortDate(item.operationDate)} · Limpiezas: {item.cleaningsCount || 0}</span></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>openCleaningForm(item)}>Marcar limpieza</button>}</div>) : <div className="empty-state">No hay check-out próximos.</div>}</section></div></section>
       : moduleMode === 'checkins' ? <section className="calendar-panel reception-panel delivery-reception-panel">
         <div className="topbar"><div><span className="eyebrow">Operación</span><h2>Entrega / Recepción</h2><p className="vehicle-subtitle">Controla por separado entregas de vehículos, check-in de alojamientos, recepciones de vehículos y check-out de alojamientos. Solo se muestran operaciones de hoy y próximo día.</p></div><div className="topbar-actions"><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística / limpieza</button><button className="secondary" onClick={() => copyVehicleReceptionLink(selectedVehicle)}>Copiar link público vehículo</button><button className="primary" onClick={() => openVehicleReception(selectedVehicle)}><Plus size={17}/> Nueva recepción vehículo</button></div></div>
         <section className="analytics-strip"><div><Car size={18}/><span>Vehículo seleccionado</span><strong>{selectedVehicle?.name || 'Sin vehículo'}</strong></div><div><span>Kilometraje actual</span><strong>{selectedVehicle?.currentKm ? `${Number(selectedVehicle.currentKm).toLocaleString('es-VE')} km` : 'Sin registro'}</strong></div><div><span>Última actualización</span><strong>{selectedVehicle?.lastKmUpdateAt ? new Date(selectedVehicle.lastKmUpdateAt).toLocaleDateString('es-VE') : 'Pendiente'}</strong></div></section>
@@ -6869,7 +6875,7 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
 
       {editingAccommodation && canManageVehicles && <div className="modal-backdrop"><form className="modal small" onSubmit={saveAccommodation}><div className="modal-header"><h3>{editingAccommodation.id ? 'Editar alojamiento' : 'Agregar alojamiento'}</h3><button type="button" onClick={() => setEditingAccommodation(null)}><X size={20}/></button></div><label>Nombre del alojamiento<input value={editingAccommodation.name||''} placeholder="Ej: Lechería con vista al mar" onChange={(e)=>setEditingAccommodation({...editingAccommodation,name:e.target.value})}/></label><label>Residencia<input value={editingAccommodation.residence||''} placeholder="Nombre de residencia / edificio" onChange={(e)=>setEditingAccommodation({...editingAccommodation,residence:e.target.value})}/></label><div className="two-columns"><label>Habitaciones<input type="number" value={editingAccommodation.rooms||''} onChange={(e)=>setEditingAccommodation({...editingAccommodation,rooms:e.target.value})}/></label><label>Baños<input type="number" value={editingAccommodation.bathrooms||''} onChange={(e)=>setEditingAccommodation({...editingAccommodation,bathrooms:e.target.value})}/></label></div><label>Capacidad máxima de huéspedes<input type="number" value={editingAccommodation.maxCapacity||''} placeholder="Ej: 5" onChange={(e)=>setEditingAccommodation({...editingAccommodation,maxCapacity:e.target.value})}/></label><div className="two-columns"><label>Hora de Check in<input type="time" value={editingAccommodation.checkInTime||'15:00'} onChange={(e)=>setEditingAccommodation({...editingAccommodation,checkInTime:e.target.value})}/></label><label>Hora de Check out<input type="time" value={editingAccommodation.checkOutTime||'11:00'} onChange={(e)=>setEditingAccommodation({...editingAccommodation,checkOutTime:e.target.value})}/></label></div><div className="two-columns"><label>Costo por noche $<input type="number" value={editingAccommodation.nightlyRate||''} onChange={(e)=>setEditingAccommodation({...editingAccommodation,nightlyRate:e.target.value})}/></label><label>Costo de limpieza $<input type="number" value={editingAccommodation.cleaningFee||''} onChange={(e)=>setEditingAccommodation({...editingAccommodation,cleaningFee:e.target.value})}/></label></div><label>Inversión del alojamiento $<input type="number" min="0" step="0.01" value={editingAccommodation.investmentCost||''} placeholder="Ej: 25000" onChange={(e)=>setEditingAccommodation({...editingAccommodation,investmentCost:e.target.value})}/></label><section className="document-box"><h4>Modelo comercial</h4><div className="two-columns"><label>Tipo de alojamiento<select value={editingAccommodation.ownershipType || 'Propio'} onChange={(e)=>setEditingAccommodation({...editingAccommodation,ownershipType:e.target.value})}><option>Propio</option><option>Aliado</option></select></label>{editingAccommodation.ownershipType === 'Aliado' && <label>Propietario / aliado<input value={editingAccommodation.allyOwnerName || ''} placeholder="Nombre del propietario" onChange={(e)=>setEditingAccommodation({...editingAccommodation,allyOwnerName:e.target.value})}/></label>}</div>{editingAccommodation.ownershipType === 'Aliado' && <div className="two-columns"><label>Modelo ganancia<select value={editingAccommodation.allyProfitMode || 'fixed'} onChange={(e)=>setEditingAccommodation({...editingAccommodation,allyProfitMode:e.target.value})}><option value="fixed">Monto fijo $</option><option value="percent">Porcentaje %</option></select></label><label>{editingAccommodation.allyProfitMode === 'percent' ? 'Porcentaje Alohandote %' : 'Ganancia Alohandote $'}<input type="number" min="0" step="0.01" value={editingAccommodation.allyProfitValue || ''} placeholder={editingAccommodation.allyProfitMode === 'percent' ? 'Ej: 25' : 'Ej: 25'} onChange={(e)=>setEditingAccommodation({...editingAccommodation,allyProfitValue:e.target.value})}/></label></div>}<small>Propio: el ingreso completo pertenece a Alohandote. Aliado: el sistema separa ganancia Alohandote y cuenta por pagar al propietario.</small></section><div className="feature-grid"><label><input type="checkbox" checked={!!editingAccommodation.hotWater} onChange={(e)=>setEditingAccommodation({...editingAccommodation,hotWater:e.target.checked})}/> Agua caliente</label><label><input type="checkbox" checked={!!editingAccommodation.ac} onChange={(e)=>setEditingAccommodation({...editingAccommodation,ac:e.target.checked})}/> Aire acondicionado</label><label><input type="checkbox" checked={!!editingAccommodation.pool} onChange={(e)=>setEditingAccommodation({...editingAccommodation,pool:e.target.checked})}/> Piscina</label><label><input type="checkbox" checked={!!editingAccommodation.elevator} onChange={(e)=>setEditingAccommodation({...editingAccommodation,elevator:e.target.checked})}/> Ascensor</label><label><input type="checkbox" checked={!!editingAccommodation.parking} onChange={(e)=>setEditingAccommodation({...editingAccommodation,parking:e.target.checked})}/> Estacionamiento</label><label><input type="checkbox" checked={!!editingAccommodation.wifi} onChange={(e)=>setEditingAccommodation({...editingAccommodation,wifi:e.target.checked})}/> Wifi</label><label><input type="checkbox" checked={!!editingAccommodation.equippedKitchen} onChange={(e)=>setEditingAccommodation({...editingAccommodation,equippedKitchen:e.target.checked})}/> Cocina equipada</label><label><input type="checkbox" checked={!!editingAccommodation.coffeeMaker} onChange={(e)=>setEditingAccommodation({...editingAccommodation,coffeeMaker:e.target.checked})}/> Cafetera</label><label><input type="checkbox" checked={!!editingAccommodation.microwave} onChange={(e)=>setEditingAccommodation({...editingAccommodation,microwave:e.target.checked})}/> Microondas</label><label><input type="checkbox" checked={!!editingAccommodation.airFryer} onChange={(e)=>setEditingAccommodation({...editingAccommodation,airFryer:e.target.checked})}/> Air fryer</label><label><input type="checkbox" checked={!!editingAccommodation.iron} onChange={(e)=>setEditingAccommodation({...editingAccommodation,iron:e.target.checked})}/> Plancha de ropa</label><label><input type="checkbox" checked={!!editingAccommodation.sofaBed} onChange={(e)=>setEditingAccommodation({...editingAccommodation,sofaBed:e.target.checked})}/> Sofá cama</label><label><input type="checkbox" checked={!!editingAccommodation.sofa} onChange={(e)=>setEditingAccommodation({...editingAccommodation,sofa:e.target.checked})}/> Sofá tradicional</label><label><input type="checkbox" checked={!!editingAccommodation.bedding} onChange={(e)=>setEditingAccommodation({...editingAccommodation,bedding:e.target.checked})}/> Ropa de cama</label></div><div className="two-columns"><label>Cantidad de TV<input type="number" min="0" value={editingAccommodation.tvCount||''} placeholder="Ej: 2" onChange={(e)=>setEditingAccommodation({...editingAccommodation,tvCount:e.target.value})}/></label><label>Cantidad de toallas<input type="number" min="0" value={editingAccommodation.towelsCount||''} placeholder="Ej: 6" onChange={(e)=>setEditingAccommodation({...editingAccommodation,towelsCount:e.target.value})}/></label></div><section className="ical-multi-box"><div className="ical-multi-head"><strong>Calendarios iCal externos</strong><small>Puedes importar hasta 4 calendarios: Airbnb, Booking u otra plataforma.</small></div>{[0,1,2,3].map((idx)=>{ const list = Array.isArray(editingAccommodation.icalUrls) ? editingAccommodation.icalUrls : [editingAccommodation.icalUrl || '', '', '', '']; return <label key={`ical-url-${idx}`}>URL iCal #{idx+1}<input value={list[idx]||''} placeholder={idx===0 ? 'Pega aquí el enlace iCal principal' : 'Opcional'} onChange={(e)=>updateAccommodationIcalUrl(idx, e.target.value)}/></label> })}{accommodationIcalUrls(editingAccommodation).length > 0 && <button type="button" className="secondary" onClick={()=>setEditingAccommodation({...editingAccommodation,icalUrl:'',icalUrls:['','','','']})}>Eliminar / desvincular iCal guardados</button>}</section><label>URL ubicación Google Maps<input value={editingAccommodation.mapsUrl||''} placeholder="https://maps.google.com/..." onChange={(e)=>setEditingAccommodation({...editingAccommodation,mapsUrl:e.target.value})}/></label><section className="photo-manager"><div className="photo-manager-head"><div><strong>Fotos del catálogo</strong><small>Ordena, revisa o elimina las fotos antes de guardar.</small></div><span>{(Array.isArray(editingAccommodation.photos)?editingAccommodation.photos.length:0) + Array.from(editingAccommodation._photoFiles || []).length}/9</span></div>{Array.isArray(editingAccommodation.photos) && editingAccommodation.photos.length > 0 && <div className="photo-grid-editor">{editingAccommodation.photos.slice(0,9).map((photo, index)=><figure key={`saved-${index}`}><img src={photoUrl(photo)} alt={photoName(photo,index)} onError={(e)=>{e.currentTarget.style.display='none'; e.currentTarget.parentElement?.classList.add('thumb-broken')}}/><figcaption>Foto {index+1}</figcaption><div className="photo-tools"><button type="button" onClick={()=>moveAccommodationPhoto(index,-1)} disabled={index===0}>←</button><button type="button" onClick={()=>moveAccommodationPhoto(index,1)} disabled={index===editingAccommodation.photos.length-1}>→</button><button type="button" className="danger-mini" onClick={()=>removeAccommodationPhoto(index)}>✕</button></div></figure>)}</div>}<label className="file-pick">Agregar fotos al catálogo<input type="file" multiple accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingAccommodation({...editingAccommodation,_photoFiles:Array.from(e.target.files || []).slice(0, Math.max(0, 9 - (Array.isArray(editingAccommodation.photos)?editingAccommodation.photos.length:0)))})}/><small>JPG, PNG, WEBP o HEIC. Máximo 9 fotos en el catálogo.</small></label>{Array.from(editingAccommodation._photoFiles || []).length > 0 && <div className="photo-grid-editor pending">{Array.from(editingAccommodation._photoFiles || []).map((file,index)=><figure key={`pending-${index}-${file.name}`}><img src={URL.createObjectURL(file)} alt={file.name}/><figcaption>Nueva {index+1}</figcaption><div className="photo-tools"><button type="button" onClick={()=>movePendingAccommodationPhoto(index,-1)} disabled={index===0}>←</button><button type="button" onClick={()=>movePendingAccommodationPhoto(index,1)} disabled={index===Array.from(editingAccommodation._photoFiles || []).length-1}>→</button><button type="button" className="danger-mini" onClick={()=>removePendingAccommodationPhoto(index)}>✕</button></div></figure>)}</div>}<small className="photo-note">El orden visible aquí será el mismo orden del catálogo PDF. Guarda el alojamiento para conservar los cambios.</small></section><label>Observaciones<textarea rows="3" value={editingAccommodation.notes||''} placeholder="Capacidad, internet, normas, ubicación, detalles importantes" onChange={(e)=>setEditingAccommodation({...editingAccommodation,notes:e.target.value})}/></label><div className="modal-actions">{editingAccommodation.id && <button type="button" className="danger" onClick={()=>deleteAccommodation(editingAccommodation)}><Trash2 size={17}/> Eliminar</button>}{editingAccommodation.id && <button type="button" className="secondary" onClick={()=>shareAccommodationCatalog(editingAccommodation)}>Catálogo PDF / Compartir</button>}{editingAccommodation.id && <button type="button" className="secondary" onClick={()=>repairAccommodationHeicPhotos(editingAccommodation)}>Reparar fotos HEIC</button>}<button type="submit" className="primary" disabled={accommodationSaving}>{accommodationSaving ? 'Guardando fotos...' : 'Guardar alojamiento'}</button></div></form></div>}
 
-      {editingVehicleDelivery && <div className="modal-backdrop"><form className="modal small" onSubmit={saveVehicleDelivery}><div className="modal-header"><h3>Entrega de vehículo</h3><button type="button" onClick={() => setEditingVehicleDelivery(null)}><X size={20}/></button></div>{operationDetailLine(editingVehicleDelivery) && <section className="document-box operation-context"><strong>{editingVehicleDelivery.customerName || 'Cliente'}</strong><small>{operationDetailLine(editingVehicleDelivery)}</small></section>}{vehicleContractAvailableForOperation(editingVehicleDelivery) && <div className="top-doc-actions"><button type="button" className="secondary" onClick={()=>printVehicleContractFromOperation(editingVehicleDelivery)}><FileText size={17}/> Contrato PDF</button></div>}{editingVehicleDelivery.logisticsNote && <section className="document-box operation-context"><h4>📋 Instrucciones logísticas</h4><p style={{ whiteSpace: 'pre-line', margin: 0 }}>{editingVehicleDelivery.logisticsNote}</p></section>}<label>Vehículo<select value={editingVehicleDelivery.vehicleId || ''} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, vehicleId:e.target.value, currentKm: vehicles.find((v)=>v.id===e.target.value)?.currentKm || '' })}>{vehicles.map((vehicle)=><option key={vehicle.id} value={vehicle.id}>{vehicle.name}</option>)}</select></label><label>Responsable de entregar<select value={editingVehicleDelivery.responsible || ''} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, responsible:e.target.value })}>{operationsPeople.map((name)=><option key={name} value={name}>{name}</option>)}</select></label><div className="two-columns"><label>KM salida<input type="number" min="0" value={editingVehicleDelivery.currentKm || ''} placeholder="Ej: 45650" onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, currentKm:e.target.value })}/></label><label>Nivel de combustible<select value={editingVehicleDelivery.fuelLevel || 'Completo'} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, fuelLevel:e.target.value })}><option>Completo</option><option>3/4</option><option>Medio tanque</option><option>1/4</option><option>Bajo</option></select></label></div><label>Estado general<select value={editingVehicleDelivery.generalStatus || 'Bueno'} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, generalStatus:e.target.value })}><option>Bueno</option><option>Con observación</option><option>Requiere revisión</option></select></label><div className="two-columns"><label className="file-pick">Foto tablero<input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, _dashboardPhotoFile:e.target.files?.[0] || null })}/><small>{editingVehicleDelivery._dashboardPhotoFile?.name || 'Odómetro / tablero'}</small></label><label className="file-pick">Foto vehículo<input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, _vehiclePhotoFile:e.target.files?.[0] || null })}/><small>{editingVehicleDelivery._vehiclePhotoFile?.name || 'Exterior del vehículo'}</small></label></div><label>Observación<textarea rows="3" value={editingVehicleDelivery.notes || ''} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, notes:e.target.value })}/></label><div className="modal-actions"><button type="button" className="secondary" onClick={()=>setEditingVehicleDelivery(null)}>Cancelar</button><button type="submit" className="primary">Guardar entrega</button></div></form></div>}
+      {editingVehicleDelivery && <div className="modal-backdrop"><form className="modal small" onSubmit={saveVehicleDelivery}><div className="modal-header"><h3>Entrega de vehículo</h3><button type="button" onClick={() => setEditingVehicleDelivery(null)}><X size={20}/></button></div>{operationDetailLine(editingVehicleDelivery) && <section className="document-box operation-context"><strong>{editingVehicleDelivery.customerName || 'Cliente'}</strong><small>{operationDetailLine(editingVehicleDelivery)}</small></section>}<button type="button" className="secondary" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, width: 'fit-content', margin: '10px 0 12px' }} onClick={()=>printVehicleContractFromOperation(editingVehicleDelivery)}><FileText size={17}/> Contrato PDF</button>{editingVehicleDelivery.logisticsNote && <section className="document-box operation-context"><h4>📋 Instrucciones logísticas</h4><p style={{ whiteSpace: 'pre-line', margin: 0 }}>{editingVehicleDelivery.logisticsNote}</p></section>}<label>Vehículo<select value={editingVehicleDelivery.vehicleId || ''} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, vehicleId:e.target.value, currentKm: vehicles.find((v)=>v.id===e.target.value)?.currentKm || '' })}>{vehicles.map((vehicle)=><option key={vehicle.id} value={vehicle.id}>{vehicle.name}</option>)}</select></label><label>Responsable de entregar<select value={editingVehicleDelivery.responsible || ''} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, responsible:e.target.value })}>{operationsPeople.map((name)=><option key={name} value={name}>{name}</option>)}</select></label><div className="two-columns"><label>KM salida<input type="number" min="0" value={editingVehicleDelivery.currentKm || ''} placeholder="Ej: 45650" onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, currentKm:e.target.value })}/></label><label>Nivel de combustible<select value={editingVehicleDelivery.fuelLevel || 'Completo'} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, fuelLevel:e.target.value })}><option>Completo</option><option>3/4</option><option>Medio tanque</option><option>1/4</option><option>Bajo</option></select></label></div><label>Estado general<select value={editingVehicleDelivery.generalStatus || 'Bueno'} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, generalStatus:e.target.value })}><option>Bueno</option><option>Con observación</option><option>Requiere revisión</option></select></label><div className="two-columns"><label className="file-pick">Foto tablero<input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, _dashboardPhotoFile:e.target.files?.[0] || null })}/><small>{editingVehicleDelivery._dashboardPhotoFile?.name || 'Odómetro / tablero'}</small></label><label className="file-pick">Foto vehículo<input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, _vehiclePhotoFile:e.target.files?.[0] || null })}/><small>{editingVehicleDelivery._vehiclePhotoFile?.name || 'Exterior del vehículo'}</small></label></div><label>Observación<textarea rows="3" value={editingVehicleDelivery.notes || ''} onChange={(e)=>setEditingVehicleDelivery({ ...editingVehicleDelivery, notes:e.target.value })}/></label><div className="modal-actions"><button type="button" className="secondary" onClick={()=>setEditingVehicleDelivery(null)}>Cancelar</button><button type="submit" className="primary">Guardar entrega</button></div></form></div>}
 
       {editingCleaningTask && <div className="modal-backdrop"><form className="modal small" onSubmit={saveCleaningTask}><div className="modal-header"><h3>Registro de limpieza</h3><button type="button" onClick={() => setEditingCleaningTask(null)}><X size={20}/></button></div><label>Alojamiento<input value={editingCleaningTask.accommodationName || accommodations.find((apt)=>apt.id===editingCleaningTask.accommodationId)?.name || ''} readOnly /></label>{operationDetailLine(editingCleaningTask) && <section className="document-box operation-context"><strong>{editingCleaningTask.customerName || 'Huésped'}</strong><small>{operationDetailLine(editingCleaningTask)}</small></section>}<label>Responsable de limpieza<select value={editingCleaningTask.responsible || ''} onChange={(e)=>setEditingCleaningTask({ ...editingCleaningTask, responsible:e.target.value })}>{operationsPeople.map((name)=><option key={name} value={name}>{name}</option>)}</select></label><label className="file-pick">Foto daño / incidencia<input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingCleaningTask({ ...editingCleaningTask, _damagePhotoFile:e.target.files?.[0] || null })}/><small>{editingCleaningTask._damagePhotoFile?.name || 'Opcional: daño o incidencia'}</small></label><div className="two-columns"><label>Artículo usado<select value={editingCleaningTask.inventoryItemId || ''} onChange={(e)=>setEditingCleaningTask({ ...editingCleaningTask, inventoryItemId:e.target.value })}><option value="">Sin consumo</option>{inventoryItemsStore.items.filter((item)=>item.module === 'Alojamientos' || item.module === 'General').map((item)=><option key={item.id} value={item.id}>{item.name} · Stock {item.quantity}</option>)}</select></label><label>Cantidad<input type="number" min="0" step="1" value={editingCleaningTask.quantity || ''} onChange={(e)=>setEditingCleaningTask({ ...editingCleaningTask, quantity:e.target.value })}/></label></div><label>Observación<textarea rows="3" value={editingCleaningTask.notes || ''} placeholder="Daños, consumo, observaciones de limpieza..." onChange={(e)=>setEditingCleaningTask({ ...editingCleaningTask, notes:e.target.value })}/></label><div className="modal-actions"><button type="button" className="secondary" onClick={()=>setEditingCleaningTask(null)}>Cancelar</button><button type="submit" className="primary">Guardar limpieza</button></div></form></div>}
 

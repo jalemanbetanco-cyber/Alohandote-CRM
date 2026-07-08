@@ -1,6 +1,13 @@
 import { getFirestoreAuthHeaders, setSecurityHeaders, safeSlug } from './_serverSecurity.js'
 
-const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID || 'alohandote-rent-calendar'
+// V223.5.2.8 HOTFIX DEFINITIVO iCal
+// El backend iCal debe leer SIEMPRE el proyecto real de Firestore.
+// No usamos VITE_FIREBASE_PROJECT_ID como prioridad porque en algunos entornos
+// quedó apuntando al proyecto antiguo `alohandote-rent-calendar`, lo que generaba
+// feeds vacíos/intermitentes aunque las reservas existieran en `alohandote-produccion`.
+const ENV_FIREBASE_PROJECT_ID = String(process.env.FIREBASE_PROJECT_ID || '').trim()
+const VITE_FIREBASE_PROJECT_ID = String(process.env.VITE_FIREBASE_PROJECT_ID || '').trim()
+const PROJECT_ID = ENV_FIREBASE_PROJECT_ID || (VITE_FIREBASE_PROJECT_ID === 'alohandote-produccion' ? VITE_FIREBASE_PROJECT_ID : 'alohandote-produccion')
 const API_KEY = process.env.FIREBASE_API_KEY || process.env.VITE_FIREBASE_API_KEY || ''
 
 export function addDaysToIsoDate(value, days = 1) {
@@ -40,7 +47,7 @@ export function escapeIcal(value = '') {
 
 export function fieldValue(fields = {}, key) {
   const field = fields[key] || {}
-  return field.stringValue ?? field.integerValue ?? field.doubleValue ?? field.booleanValue ?? ''
+  return field.stringValue ?? field.integerValue ?? field.doubleValue ?? field.booleanValue ?? field.timestampValue ?? ''
 }
 
 export function isImportedIcalFields(fields = {}) {
@@ -70,20 +77,35 @@ export async function fetchAllDocuments(collectionName) {
 }
 
 async function fetchLodgingIcalDocuments() {
-  // V185: para Airbnb/Booking priorizamos la colección pública mínima.
-  // Evitamos depender de reservas privadas protegidas por login.
+  // V223.5.2.8: export iCal autocurativo.
+  // Antes se devolvía publicIcalBlocks si la colección tenía cualquier documento.
+  // Eso podía dejar feeds vacíos/intermitentes cuando publicIcalBlocks estaba incompleto
+  // para un alojamiento específico. Ahora combinamos fuente pública + reservas internas.
+  const docs = []
   try {
     const publicDocs = await fetchAllDocuments('publicIcalBlocks')
-    if (publicDocs.length) return publicDocs
+    docs.push(...publicDocs)
   } catch (error) {
     console.warn('iCal publicIcalBlocks no disponible:', error?.message || error)
   }
   try {
-    return await fetchAllDocuments('lodgingReservations')
+    const privateDocs = await fetchAllDocuments('lodgingReservations')
+    docs.push(...privateDocs)
   } catch (error) {
     console.warn('iCal lodgingReservations no disponible:', error?.message || error)
-    return []
   }
+  console.log(
+  "ICAL_DOC_SAMPLE",
+  JSON.stringify(
+    docs.slice(0,3).map(doc => ({
+      name: doc.name,
+      fields: Object.keys(doc.fields || {})
+    })),
+    null,
+    2
+  )
+)
+  return docs
 }
 
 // Datos personales ocultos: el feed iCal publica solo disponibilidad.
@@ -93,25 +115,63 @@ export async function buildLodgingIcalBody(rawAccommodationId) {
 
   const docs = await fetchLodgingIcalDocuments()
   const events = []
+  const seen = new Set()
   for (const doc of docs) {
     const fields = doc.fields || {}
-    if (String(fieldValue(fields, 'accommodationId')) !== accommodationId) continue
+    const rowAccommodationCandidates = [
+  fieldValue(fields, 'accommodationId'),
+  fieldValue(fields, 'lodgingId'),
+  fieldValue(fields, 'propertyId'),
+  fieldValue(fields, 'assetId'),
+  fieldValue(fields, 'roomId'),
+  fieldValue(fields, 'accommodationSlug'),
+  fieldValue(fields, 'icalSlug'),
+  fieldValue(fields, 'publicIcalSlug'),
+  fieldValue(fields, 'publicIcalId'),
+].map((value) => String(value || '').trim()).filter(Boolean)
 
-  const isPublicIcalBlock = String(doc.name || '').includes('/publicIcalBlocks/')
+const matchesAccommodation = rowAccommodationCandidates.some((value) =>
+  value === accommodationId || safeSlug(value) === accommodationId
+)
 
-// Si viene de publicIcalBlocks, debe exportarse siempre.
-// Esa colección ya es la fuente pública que Airbnb debe leer.
-if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
+if (!matchesAccommodation) continue
+    const isPublicIcalBlock = String(doc.name || '').includes('/publicIcalBlocks/')
+
+    // Si viene de publicIcalBlocks, debe exportarse siempre.
+    // Si viene de lodgingReservations, evitamos reexportar bloqueos importados desde OTAs.
+    if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
+
     const status = String(fieldValue(fields, 'status') || 'reserved').toLowerCase()
     if (['cancelled', 'canceled', 'cancelada', 'anulada'].includes(status)) continue
 
-    const start = String(fieldValue(fields, 'startDate') || '').slice(0, 10)
-    const rawEnd = String(fieldValue(fields, 'endDate') || '').slice(0, 10)
+    const start = String(
+  fieldValue(fields, 'startDate') ||
+  fieldValue(fields, 'checkIn') ||
+  fieldValue(fields, 'checkin') ||
+  fieldValue(fields, 'from') ||
+  fieldValue(fields, 'dateFrom') ||
+  fieldValue(fields, 'deliveryDate') ||
+  ''
+).slice(0, 10)
+
+const rawEnd = String(
+  fieldValue(fields, 'endDate') ||
+  fieldValue(fields, 'checkOut') ||
+  fieldValue(fields, 'checkout') ||
+  fieldValue(fields, 'to') ||
+  fieldValue(fields, 'dateTo') ||
+  fieldValue(fields, 'cleaningDate') ||
+  ''
+).slice(0, 10)
     const end = normalizeExclusiveEndDate(start, rawEnd)
     if (!start || !end) continue
     if (status === 'maintenance' && calendarDurationDays(start, rawEnd || start) <= 1) continue
 
-    const summary = status === 'maintenance' ? 'Mantenimiento' : 'No disponible'
+    // Evita duplicados cuando el mismo bloqueo existe en publicIcalBlocks y lodgingReservations.
+    const dedupeKey = `${accommodationId}|${start}|${end}|${status === 'maintenance' ? 'maintenance' : 'reserved'}`
+    if (seen.has(dedupeKey)) continue
+    seen.add(dedupeKey)
+
     const id = doc.name?.split('/').pop() || `${accommodationId}-${start}-${end}`
     events.push([
       'BEGIN:VEVENT',
@@ -123,7 +183,20 @@ if (!isPublicIcalBlock && isImportedIcalFields(fields)) continue
       'END:VEVENT',
     ].join('\r\n'))
   }
-
+console.log('ICAL_DEBUG', {
+  projectId: PROJECT_ID,
+  requestedAccommodationId: accommodationId,
+  docsRead: docs.length,
+  candidates: docs.slice(0, 20).map((doc) => ({
+    name: doc.name,
+    accommodationId: fieldValue(doc.fields || {}, 'accommodationId'),
+    lodgingId: fieldValue(doc.fields || {}, 'lodgingId'),
+    propertyId: fieldValue(doc.fields || {}, 'propertyId'),
+    startDate: fieldValue(doc.fields || {}, 'startDate'),
+    endDate: fieldValue(doc.fields || {}, 'endDate'),
+    status: fieldValue(doc.fields || {}, 'status'),
+  })),
+})
   if (!events.length) {
     // Algunos importadores externos rechazan feeds completamente vacíos.
     // Evento histórico inocuo: no bloquea disponibilidad futura.
@@ -162,10 +235,11 @@ export async function sendLodgingIcal(req, res, rawAccommodationId) {
     const body = await buildLodgingIcalBody(accommodationId)
     setSecurityHeaders(res, { calendar: true })
     // V187: headers estrictos para importadores externos.
+    res.setHeader('X-Alohandote-Ical-Project', PROJECT_ID)
     res.setHeader('Content-Type', 'text/calendar; charset=utf-8')
     res.setHeader('Content-Disposition', `attachment; filename="alohandote-${accommodationId}.ics"`)
     res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=60, stale-while-revalidate=30')
+    res.setHeader('Cache-Control', 'public, max-age=15, s-maxage=15, stale-while-revalidate=15')
     res.setHeader('X-Robots-Tag', 'noindex')
     if (req.method === 'HEAD') {
       res.status(200).end()

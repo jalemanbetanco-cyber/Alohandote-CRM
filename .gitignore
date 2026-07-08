@@ -10,3 +10,6 @@ dist/
 .vercel/
 package-lock.json
 npm-shrinkwrap.json
+
+.vercel
+.env*

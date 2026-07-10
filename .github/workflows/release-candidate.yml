@@ -1,0 +1,33 @@
+name: Release Candidate Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versión candidata a validar, ejemplo v210'
+        required: true
+        default: 'v210'
+
+jobs:
+  release-candidate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+      - name: Production check
+        run: npm run production:check
+      - name: QA regression
+        run: npm run qa:regression
+      - name: Build candidate
+        run: npm run build
+      - name: Candidate summary
+        run: |
+          echo "Release candidate ${{ github.event.inputs.version }} validated."
+          echo "Deploy to production must remain manual after user QA approval."

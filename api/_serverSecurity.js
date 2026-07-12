@@ -72,7 +72,7 @@ export function setSecurityHeaders(res, options = {}) {
   res.setHeader('X-Frame-Options', 'DENY')
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
   if (options.calendar) {
-    res.setHeader('Cache-Control', 'public, max-age=300, s-maxage=300, stale-while-revalidate=60')
+    res.setHeader('Cache-Control', 'public, max-age=1800, s-maxage=1800, stale-while-revalidate=300')
   } else {
     res.setHeader('Cache-Control', 'no-store, max-age=0')
   }

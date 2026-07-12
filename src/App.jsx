@@ -43,6 +43,7 @@ const STATUS = {
 
 const CHANNELS = ['Cliente frecuente', 'Campaña RRSS', 'Alquila YA', 'Referido', 'Aliado Comercial']
 const KM_RATE = 0.30
+const DAILY_KM_LIMIT = 150
 const COMMISSION_RATE = 0.15
 // V170: nueva caja limpia para pruebas locales/demo. No afecta Firebase/producción.
 const LOCAL_STORAGE_VERSION = 'v180'
@@ -120,7 +121,7 @@ function emptyReservation(vehicleId, selectedDate = '', profile = null, user = n
     startDate: selectedDate, endDate: selectedDate, deliveryTime: '12:00', returnTime: '12:00', contractCity: 'Barcelona',
     status: 'reserved', channel: 'Cliente frecuente', note: 'Contrato:\nDepósito/Garantía:\nLugar de entrega:',
     totalAmount: '', amount: '', depositAmount: '', approxKm: '', rentalDays: '', dailyRate: '', pricePerKm: KM_RATE, sellerCommission: '',
-    deliveryKm: '', kmRecepcion: '', kmRecorridos: '', receptionAt: '', receivedBy: '', fuelLevelReception: '', receptionStatus: '', licenseDoc: null, idDoc: null, paymentMethod: 'Pago en BS', paymentReference: '', paymentProof: null, totalAmountBs: '', amountBs: '', bcvEuroRate: '', maintenanceLaborCost: '', maintenancePartsCost: '', maintenancePaymentMethod: 'BS', expenseStatus: 'Pagado', maintenanceBsCost: '', bcvDollarRate: '', maintenanceInvoices: [],
+    deliveryKm: '', kmRecepcion: '', kmRecorridos: '', dailyKmLimit: DAILY_KM_LIMIT, includedKm: '', additionalKmPurchased: '', authorizedKm: '', excessKm: '', receptionAt: '', receivedBy: '', fuelLevelReception: '', receptionStatus: '', licenseDoc: null, idDoc: null, paymentMethod: 'Pago en BS', paymentReference: '', paymentProof: null, totalAmountBs: '', amountBs: '', bcvEuroRate: '', maintenanceLaborCost: '', maintenancePartsCost: '', maintenancePaymentMethod: 'BS', expenseStatus: 'Pagado', maintenanceBsCost: '', bcvDollarRate: '', maintenanceInvoices: [],
     createdByUid: user?.uid || '', createdByEmail: user?.email || '', createdByName: profile?.name || user?.displayName || user?.email || '',
   }
 }
@@ -771,7 +772,7 @@ async function captureAlohandoteNode(node, options){
   document.body.style.overflow='hidden';
   await new Promise(r=>setTimeout(r,250));
   var canvas=await html2canvas(node,
-  {scale:3,
+  {scale:(options&&options.scale)||3,
   backgroundColor:'#ffffff',
   useCORS:true,
   logging:false,
@@ -812,11 +813,229 @@ function addCanvasToPdfInPages(pdf, canvas, pageW, pageH, margin){
     pageIndex+=1;
   }
 }
+
+function findSafeCanvasBreak(canvas,startY,targetEnd,minSliceHeight){
+  var ctx=canvas.getContext('2d',{willReadFrequently:true});
+  var searchRadius=Math.max(80,Math.floor(canvas.width*0.10));
+  var from=Math.max(startY+minSliceHeight,targetEnd-searchRadius);
+  var to=Math.min(canvas.height-1,targetEnd+searchRadius);
+  var sampleStep=Math.max(1,Math.floor(canvas.width/320));
+  var bestY=Math.min(targetEnd,canvas.height);
+  var bestScore=-1;
+  for(var y=from;y<=to;y+=2){
+    var data=ctx.getImageData(0,y,canvas.width,1).data;
+    var white=0,total=0;
+    for(var x=0;x<canvas.width;x+=sampleStep){
+      var i=x*4;
+      if(data[i]>245&&data[i+1]>245&&data[i+2]>245&&data[i+3]>240)white++;
+      total++;
+    }
+    var score=total?white/total:0;
+    var distancePenalty=Math.abs(y-targetEnd)/Math.max(1,searchRadius)*0.03;
+    score-=distancePenalty;
+    if(score>bestScore){bestScore=score;bestY=y;}
+  }
+  return Math.max(startY+minSliceHeight,Math.min(bestY,canvas.height));
+}
+function trimCanvasWhiteMargins(canvas,padding){
+  // V223.5.7.3 MOBILE DIMENSION PARITY:
+  // elimina únicamente el borde blanco exterior de la maqueta capturada.
+  // Así evitamos sumar el padding HTML de .page + el margen del PDF,
+  // que era la causa de los márgenes laterales excesivos en mobile.
+  padding=Number.isFinite(padding)?padding:6;
+  var ctx=canvas.getContext('2d',{willReadFrequently:true});
+  var w=canvas.width,h=canvas.height;
+  var data=ctx.getImageData(0,0,w,h).data;
+  var left=w,right=-1,top=h,bottom=-1;
+  var step=Math.max(1,Math.floor(Math.min(w,h)/1400));
+  for(var y=0;y<h;y+=step){
+    for(var x=0;x<w;x+=step){
+      var i=(y*w+x)*4;
+      var visible=data[i+3]>12 && (data[i]<248 || data[i+1]<248 || data[i+2]<248);
+      if(visible){
+        if(x<left)left=x;
+        if(x>right)right=x;
+        if(y<top)top=y;
+        if(y>bottom)bottom=y;
+      }
+    }
+  }
+  if(right<left || bottom<top)return canvas;
+  left=Math.max(0,left-padding);
+  top=Math.max(0,top-padding);
+  right=Math.min(w-1,right+padding);
+  bottom=Math.min(h-1,bottom+padding);
+  var out=document.createElement('canvas');
+  out.width=Math.max(1,right-left+1);
+  out.height=Math.max(1,bottom-top+1);
+  var outCtx=out.getContext('2d');
+  outCtx.fillStyle='#ffffff';
+  outCtx.fillRect(0,0,out.width,out.height);
+  outCtx.drawImage(canvas,left,top,out.width,out.height,0,0,out.width,out.height);
+  return out;
+}
+function addCanvasToSinglePdfPage(pdf,canvas,pageW,pageH,margin){
+  // V223.5.7.3: mobile conserva una sola hoja, pero usa la misma dimensión
+  // visual que el PDF web: aprovecha el ancho útil de A4 sin doble margen.
+  var cropped=trimCanvasWhiteMargins(canvas,2);
+  // V223.5.7.4: margen PDF mínimo. La maqueta ya incluye su propio padding A4;
+  // no se agrega un segundo margen lateral que reduzca el ancho útil.
+  var sideMargin=5;
+  var topMargin=6;
+  var bottomMargin=7;
+  var maxW=pageW-sideMargin*2;
+  var maxH=pageH-topMargin-bottomMargin;
+  var scale=Math.min(maxW/cropped.width,maxH/cropped.height);
+  var drawW=cropped.width*scale;
+  var drawH=cropped.height*scale;
+  var x=(pageW-drawW)/2;
+  // Alineación superior como la versión web; evita centrar verticalmente
+  // y dejar demasiado espacio arriba y abajo.
+  var y=topMargin;
+  var img=cropped.toDataURL('image/jpeg',0.98);
+  pdf.addImage(img,'JPEG',x,y,drawW,drawH,undefined,'FAST');
+}
+
+function addCanvasToPdfInPagesSafe(pdf,canvas,pageW,pageH,margin){
+  var pdfW=pageW-margin*2;
+  var contentH=pageH-margin*2;
+  var idealSliceHeight=Math.floor(canvas.width*contentH/pdfW);
+  var minSliceHeight=Math.floor(idealSliceHeight*0.72);
+  var renderedHeight=0;
+  var pageIndex=0;
+  while(renderedHeight<canvas.height){
+    var remaining=canvas.height-renderedHeight;
+    var sliceEnd;
+    if(remaining<=idealSliceHeight){
+      sliceEnd=canvas.height;
+    }else{
+      sliceEnd=findSafeCanvasBreak(canvas,renderedHeight,renderedHeight+idealSliceHeight,minSliceHeight);
+    }
+    var sliceHeight=Math.max(1,sliceEnd-renderedHeight);
+    var pageCanvas=document.createElement('canvas');
+    pageCanvas.width=canvas.width;
+    pageCanvas.height=sliceHeight;
+    var ctx=pageCanvas.getContext('2d');
+    ctx.fillStyle='#ffffff';
+    ctx.fillRect(0,0,pageCanvas.width,pageCanvas.height);
+    ctx.drawImage(canvas,0,renderedHeight,canvas.width,sliceHeight,0,0,canvas.width,sliceHeight);
+    if(pageIndex>0)pdf.addPage('a4','p');
+    var pageImg=pageCanvas.toDataURL('image/jpeg',0.98);
+    var pageImgH=sliceHeight*pdfW/canvas.width;
+    pdf.addImage(pageImg,'JPEG',margin,margin,pdfW,pageImgH,undefined,'FAST');
+    renderedHeight=sliceEnd;
+    pageIndex++;
+  }
+}
+
 async function buildAlohandoteCleanPdfBlob(){
   var page=document.querySelector('.page');
 
-  // Contrato: PDF A4 real por texto, no captura de pantalla
+  // Contrato: desktop conserva el generador estable V223.5.7.
+  // Mobile usa la misma maqueta HTML visual de web, capturada en A4 fijo y
+  // escalada proporcionalmente para salir completa en una sola hoja.
   if(page){
+  // V223.5.14: una sola ruta PDF para Admin, Logística y cualquier perfil.
+  // La salida no depende del ancho del visor, iframe, dispositivo ni rol.
+  // Todos capturan la misma maqueta A4 fija que produjo el contrato Admin aprobado.
+  var isMobileContract=true;
+  if(isMobileContract){
+    var mobileActions=document.querySelector('.actions');
+    var previousBodyBg=document.body.style.background;
+    var previousPage={
+      width:page.style.width,maxWidth:page.style.maxWidth,minWidth:page.style.minWidth,
+      margin:page.style.margin,transform:page.style.transform,transformOrigin:page.style.transformOrigin
+    };
+    var mobileParagraphs=Array.from(page.querySelectorAll('p'));
+    var mobileTitle=page.querySelector('.title');
+    var mobileClauses=Array.from(page.querySelectorAll('.clause'));
+    var mobileSignatures=page.querySelector('.signatures');
+    var mobileLawyerSign=page.querySelector('.lawyer-sign');
+    var previousPageLayout={
+      padding:page.style.padding,fontSize:page.style.fontSize,lineHeight:page.style.lineHeight,
+      minHeight:page.style.minHeight,height:page.style.height
+    };
+    var previousTitleStyle=mobileTitle?{margin:mobileTitle.style.margin,fontSize:mobileTitle.style.fontSize}:null;
+    var previousClauseStyles=mobileClauses.map(function(node){return {margin:node.style.margin}});
+    var previousSignaturesStyle=mobileSignatures?{marginTop:mobileSignatures.style.marginTop,gap:mobileSignatures.style.gap}:null;
+    var previousLawyerStyle=mobileLawyerSign?{top:mobileLawyerSign.style.top,left:mobileLawyerSign.style.left,width:mobileLawyerSign.style.width}:null;
+    var previousParagraphStyles=mobileParagraphs.map(function(p){return {
+      textAlign:p.style.textAlign,textJustify:p.style.textJustify,
+      letterSpacing:p.style.letterSpacing,wordSpacing:p.style.wordSpacing,
+      wordBreak:p.style.wordBreak,overflowWrap:p.style.overflowWrap,
+      hyphens:p.style.hyphens,margin:p.style.margin,lineHeight:p.style.lineHeight
+    }});
+    try{
+      if(mobileActions)mobileActions.style.display='none';
+      document.body.style.background='#ffffff';
+      page.style.width='794px';
+      page.style.maxWidth='794px';
+      page.style.minWidth='794px';
+      page.style.margin='0 auto';
+      page.style.transform='none';
+      page.style.transformOrigin='top left';
+      // V223.5.7.4 MOBILE WEB PARITY:
+      // compacta solo la maqueta temporal de captura para reproducir la densidad
+      // de la versión web y permitir que el contenido use casi todo el ancho A4.
+      page.style.padding='8mm 8mm 7mm 8mm';
+      page.style.fontSize='11px';
+      page.style.lineHeight='1.12';
+      page.style.minHeight='auto';
+      page.style.height='auto';
+      if(mobileTitle){mobileTitle.style.margin='13mm 0 7px';mobileTitle.style.fontSize='14px';}
+      mobileClauses.forEach(function(node){node.style.margin='4px 0';});
+      if(mobileSignatures){mobileSignatures.style.marginTop='55px';mobileSignatures.style.gap='42px';}
+      if(mobileLawyerSign){mobileLawyerSign.style.top='5mm';mobileLawyerSign.style.left='8mm';mobileLawyerSign.style.width='32mm';}
+      mobileParagraphs.forEach(function(p){
+        p.style.textAlign='justify';
+        p.style.textJustify='inter-word';
+        p.style.letterSpacing='normal';
+        p.style.wordSpacing='normal';
+        p.style.wordBreak='normal';
+        p.style.overflowWrap='normal';
+        p.style.hyphens='none';
+        p.style.margin='4px 0';
+        p.style.lineHeight='1.12';
+      });
+      await new Promise(function(resolve){setTimeout(resolve,350)});
+      var mobileCanvas=await captureAlohandoteNode(page,{cssWidth:'794px',pixelWidth:794,minHeight:'',scale:2});
+      var mobilePdf=new jspdf.jsPDF('p','mm','a4');
+      // V223.5.7.2: en móvil el contrato completo se escala proporcionalmente
+      // para imprimirse en una sola hoja, igual que la versión web estable.
+      addCanvasToSinglePdfPage(mobilePdf,mobileCanvas,210,297,4);
+      return mobilePdf.output('blob');
+    }finally{
+      if(mobileActions)mobileActions.style.display='';
+      document.body.style.background=previousBodyBg||'';
+      page.style.width=previousPage.width||'';
+      page.style.maxWidth=previousPage.maxWidth||'';
+      page.style.minWidth=previousPage.minWidth||'';
+      page.style.margin=previousPage.margin||'';
+      page.style.transform=previousPage.transform||'';
+      page.style.transformOrigin=previousPage.transformOrigin||'';
+      page.style.padding=previousPageLayout.padding||'';
+      page.style.fontSize=previousPageLayout.fontSize||'';
+      page.style.lineHeight=previousPageLayout.lineHeight||'';
+      page.style.minHeight=previousPageLayout.minHeight||'';
+      page.style.height=previousPageLayout.height||'';
+      if(mobileTitle&&previousTitleStyle){mobileTitle.style.margin=previousTitleStyle.margin||'';mobileTitle.style.fontSize=previousTitleStyle.fontSize||'';}
+      mobileClauses.forEach(function(node,index){var prev=previousClauseStyles[index]||{};node.style.margin=prev.margin||'';});
+      if(mobileSignatures&&previousSignaturesStyle){mobileSignatures.style.marginTop=previousSignaturesStyle.marginTop||'';mobileSignatures.style.gap=previousSignaturesStyle.gap||'';}
+      if(mobileLawyerSign&&previousLawyerStyle){mobileLawyerSign.style.top=previousLawyerStyle.top||'';mobileLawyerSign.style.left=previousLawyerStyle.left||'';mobileLawyerSign.style.width=previousLawyerStyle.width||'';}
+      mobileParagraphs.forEach(function(p,index){
+        var prev=previousParagraphStyles[index]||{};
+        p.style.textAlign=prev.textAlign||'';
+        p.style.textJustify=prev.textJustify||'';
+        p.style.letterSpacing=prev.letterSpacing||'';
+        p.style.wordSpacing=prev.wordSpacing||'';
+        p.style.wordBreak=prev.wordBreak||'';
+        p.style.overflowWrap=prev.overflowWrap||'';
+        p.style.hyphens=prev.hyphens||'';
+        p.style.margin=prev.margin||'';
+        p.style.lineHeight=prev.lineHeight||'';
+      });
+    }
+  }
   var pdf=new jspdf.jsPDF('p','mm','a4');
   var pageW=210, pageH=297;
   var margin=16;
@@ -833,21 +1052,54 @@ async function buildAlohandoteCleanPdfBlob(){
     }catch(_e){}
   }
 
+  function normalizeContractPdfText(text){
+    return String(text||'')
+      .normalize('NFC')
+      .replace(/[  -​  　]/g,' ')
+      .replace(/\s+/g,' ')
+      .trim();
+  }
+
+  function writeJustifiedLine(line,x,y,maxWidth){
+    line=normalizeContractPdfText(line);
+    if(!line)return;
+    var words=line.split(' ').filter(Boolean);
+    if(words.length<=1){ pdf.text(line,x,y); return; }
+    var wordsWidth=words.reduce(function(sum,word){ return sum+pdf.getTextWidth(word); },0);
+    var gap=(maxWidth-wordsWidth)/(words.length-1);
+    if(!isFinite(gap) || gap<1 || gap>5){ pdf.text(line,x,y); return; }
+    var cursor=x;
+    words.forEach(function(word,index){
+      pdf.text(word,cursor,y);
+      cursor+=pdf.getTextWidth(word)+(index<words.length-1?gap:0);
+    });
+  }
+
   function addText(text,size,bold,align){
-    text=String(text||'').replace(/\s+/g,' ').trim();
+    text=normalizeContractPdfText(text);
     if(!text)return;
-    pdf.setFont('times',bold?'bold':'normal');
+    // V223.5.7: se usa Helvetica embebida de jsPDF para evitar pérdida de letras
+    // observada en mobile/web con Times + conversión. El HTML de vista previa mantiene Times.
+    pdf.setFont('helvetica',bold?'bold':'normal');
     pdf.setFontSize(size||8.7);
     var lines=pdf.splitTextToSize(text,usableW);
     var lineH=(size||10)*0.44;
     if(align==='center'){
       lines.forEach(function(line){
-        pdf.text(line,pageW/2,y,{align:'center'});
+        pdf.text(normalizeContractPdfText(line),pageW/2,y,{align:'center'});
         y+=lineH;
       });
     }else{
-      pdf.text(lines,margin,y);
-      y+=lines.length*lineH;
+      lines.forEach(function(line,index){
+        var normalizedLine=normalizeContractPdfText(line);
+        var isLast=index===lines.length-1;
+        if(!isLast && normalizedLine.split(' ').length>3){
+          writeJustifiedLine(normalizedLine,margin,y,usableW);
+        }else{
+          pdf.text(normalizedLine,margin,y);
+        }
+        y+=lineH;
+      });
     }
     y+=1.4;
   }
@@ -920,7 +1172,7 @@ async function shareAlohandoteCleanPdf(){
     const fileName='${safeName}.pdf';
     const file=new File([blob],fileName,{type:'application/pdf'});
     if(navigator.canShare && navigator.canShare({files:[file]})){
-      await navigator.share({files:[file],title:fileName});
+      await navigator.share({files:[file]});
       try{
         if(window.parent && window.parent!==window){
         window.parent.postMessage({type:'alohandote:return-to-form',source:'document-preview'}, window.location.origin);
@@ -982,7 +1234,7 @@ if (event.data?.type === 'alohandote:share-pdf-blob' || event.data?.type === 'al
         if (!blob) throw new Error('PDF no disponible para compartir.')
         const file = new File([blob], fileName, { type: 'application/pdf' })
         if (navigator.canShare && navigator.canShare({ files: [file] })) {
-          await navigator.share({ files: [file], title: fileName })
+          await navigator.share({ files: [file] })
           closePrintableOverlay()
           window.focus()
           return
@@ -1334,6 +1586,27 @@ function vehicleKmRate(vehicle) { return Number(vehicle?.pricePerKm || vehicle?.
 function vehicleDayRate(vehicle) { return Number(vehicle?.dailyRentalRate || vehicle?.dayRate || vehicle?.dailyRate || 0) || 0 }
 function quoteFromKm(km, rate = KM_RATE) { return Number((num(km) * num(rate || KM_RATE)).toFixed(2)) }
 function quoteBaseFromDays(days, dailyRate) { return Number((num(days) * num(dailyRate)).toFixed(2)) }
+function reservationAdditionalKmPurchased(reservation = {}) {
+  // V223.5.14: additionalKmPurchased nace vacío en reservas nuevas. El operador
+  // introduce los KM comprados en approxKm desde la calculadora cotizadora.
+  // No usamos ?? porque una cadena vacía o un 0 inicial ocultaban approxKm y
+  // provocaban falsos positivos de exceso al recepcionar el vehículo.
+  const frozenAdditionalKm = Math.max(0, num(reservation.additionalKmPurchased))
+  if (frozenAdditionalKm > 0) return frozenAdditionalKm
+  return Math.max(0, num(reservation.approxKm || reservation.quotedAdditionalKm || reservation.extraKm || 0))
+}
+function reservationKmAllowance(reservation = {}, receivedKm = null) {
+  const days = Math.max(1, daysForReservation(reservation) || 1)
+  const dailyLimit = Math.max(0, num(reservation.dailyKmLimit || DAILY_KM_LIMIT) || DAILY_KM_LIMIT)
+  const includedKm = days * dailyLimit
+  const additionalKmPurchased = reservationAdditionalKmPurchased(reservation)
+  const authorizedKm = includedKm + additionalKmPurchased
+  const deliveryKm = num(reservation.deliveryKm || reservation.deliveryKmReal || reservation.kmEntrega || 0)
+  const receptionKm = receivedKm === null ? num(reservation.kmRecepcion || 0) : num(receivedKm)
+  const kmDriven = deliveryKm > 0 && receptionKm >= deliveryKm ? receptionKm - deliveryKm : 0
+  const excessKm = Math.max(0, kmDriven - authorizedKm)
+  return { days, dailyLimit, includedKm, additionalKmPurchased, authorizedKm, deliveryKm, receptionKm, kmDriven, excessKm }
+}
 
 function commissionFromTotal(total) { return Number((num(total) * COMMISSION_RATE).toFixed(2)) }
 function kmFromTotal(total, rate = KM_RATE) { return total ? Number((num(total) / num(rate || KM_RATE)).toFixed(2)) : '' }
@@ -1459,6 +1732,32 @@ function formatDocumentDayDate(iso) {
   const number = new Intl.DateTimeFormat('es-VE', { day: '2-digit' }).format(date)
   const month = new Intl.DateTimeFormat('es-VE', { month: 'short' }).format(date).replace('.', '').toLowerCase()
   return `${dayCap}-${number} ${month}`
+}
+
+// V223.5.11: encabezados logísticos calculados siempre con la fecha de Venezuela.
+function caracasIsoDate(offsetDays = 0) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Caracas',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date())
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
+  const base = new Date(Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day), 12, 0, 0))
+  base.setUTCDate(base.getUTCDate() + Number(offsetDays || 0))
+  return base.toISOString().slice(0, 10)
+}
+
+function logisticsDayLabel(offsetDays = 0) {
+  const iso = caracasIsoDate(offsetDays)
+  const date = new Date(`${iso}T12:00:00Z`)
+  const weekdayRaw = new Intl.DateTimeFormat('es-VE', {
+    weekday: 'long',
+    timeZone: 'UTC',
+  }).format(date)
+  const weekday = weekdayRaw.charAt(0).toUpperCase() + weekdayRaw.slice(1)
+  const [year, month, day] = iso.split('-')
+  return `${weekday} ${day}-${month}-${year.slice(-2)}`
 }
 
 function joinDocs(reservation) {
@@ -4535,6 +4834,41 @@ ${noteLine}`.trim(),
       String(item.accommodationId || '') === accommodationId && isIcalImportedBlock(item)
     )
 
+    // V223.5.10 HOTFIX OPERACIONES PERSISTENTES:
+    // La reconciliación iCal elimina y reconstruye los bloqueos externos. Antes de
+    // eliminarlos guardamos sus marcas operativas para que check-in, check-out y
+    // limpieza completados no vuelvan a aparecer como tareas pendientes.
+    const previousImportedByIdentity = new Map()
+    for (const item of importedForAccommodation) {
+      const identities = [
+        String(item.externalUid || '').trim(),
+        `${String(item.icalSourceKey || '').trim()}::${String(item.startDate || '').slice(0, 10)}::${String(item.endDate || '').slice(0, 10)}`,
+        `${String(item.startDate || '').slice(0, 10)}::${String(item.endDate || '').slice(0, 10)}::${normalizeText(item.customerName || item.summary || '')}`,
+      ].filter(Boolean)
+      for (const identity of identities) previousImportedByIdentity.set(identity, item)
+    }
+
+    function previousOperationalStateForEvent(event = {}) {
+      const candidates = [
+        String(event.externalUid || '').trim(),
+        `${String(event.sourceKey || '').trim()}::${String(event.startDate || '').slice(0, 10)}::${String(event.endDate || '').slice(0, 10)}`,
+        `${String(event.startDate || '').slice(0, 10)}::${String(event.endDate || '').slice(0, 10)}::${normalizeText(event.summary || '')}`,
+      ].filter(Boolean)
+      const previous = candidates.map((key) => previousImportedByIdentity.get(key)).find(Boolean)
+      if (!previous) return {}
+      const fields = [
+        'checkInStatus', 'checkInDoneAt', 'checkInBy',
+        'deliveryStatus', 'deliveryCompletedAt', 'deliveredAt', 'deliveredBy',
+        'checkOutStatus', 'checkOutDoneAt', 'checkOutBy',
+        'cleaningStatus', 'cleaningCompletedAt', 'cleaningBy',
+        'receptionCompletedAt', 'returnedAt', 'operationCompletedAt',
+      ]
+      return fields.reduce((acc, field) => {
+        if (previous[field] !== undefined && previous[field] !== null && previous[field] !== '') acc[field] = previous[field]
+        return acc
+      }, {})
+    }
+
     let removed = 0
     for (const item of importedForAccommodation) {
       if (item?.id) {
@@ -4545,8 +4879,10 @@ ${noteLine}`.trim(),
 
     let created = 0
     for (const event of uniqueExternal.values()) {
+      const preservedOperationalState = previousOperationalStateForEvent(event)
       await lodgingStore.createItem({
         ...emptyLodgingReservation(accommodationId, event.startDate, profile, user),
+        ...preservedOperationalState,
         accommodationName: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
         propertyName: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
         assetName: targetAccommodation.name || targetAccommodation.residence || 'Alojamiento',
@@ -4705,45 +5041,135 @@ Verifica que todos los enlaces iCal guardados respondan correctamente.`)
   }
 
 
+  // V223.5.9.1: scheduler iCal de bajo consumo.
+  // Horario operativo calculado en America/Caracas, donde funciona Alohandote:
+  // - Propios: 09:00–18:00 cada 1 hora; 18:00–09:00 cada 3 horas.
+  // - Aliados: cada 3 horas durante todo el día.
+  // El intervalo de 5 minutos solo revisa si corresponde; no consulta Airbnb/Estei ni Firestore si aún no vence.
+  function icalSchedulerHourInCaracas(date = new Date()) {
+    try {
+      return Number(new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'America/Caracas',
+        hour: '2-digit',
+        hour12: false,
+      }).format(date))
+    } catch (_) {
+      return date.getHours()
+    }
+  }
+
+  function icalSchedulerIntervalMs(apt = {}, now = new Date()) {
+    const ownership = String(
+      apt.ownershipType || apt.lodgingOwnershipType || apt.propertyType || 'Propio'
+    ).trim().toLowerCase()
+    const isAlly = ownership.includes('aliado') || ownership.includes('ally')
+    if (isAlly) return 3 * 60 * 60 * 1000
+    const hour = icalSchedulerHourInCaracas(now)
+    const isDayWindow = hour >= 9 && hour < 18
+    return isDayWindow ? 60 * 60 * 1000 : 3 * 60 * 60 * 1000
+  }
+
+  function icalSchedulerLastSyncMs(apt = {}) {
+    const candidates = [
+      apt.lastIcalSyncAt,
+      ...(Array.isArray(apt.icalSyncStatus) ? apt.icalSyncStatus.map((row) => row?.lastSyncAt) : []),
+    ]
+      .map((value) => new Date(value || 0).getTime())
+      .filter((value) => Number.isFinite(value) && value > 0)
+    return candidates.length ? Math.max(...candidates) : 0
+  }
+
+  function icalSchedulerIsDue(apt = {}, now = new Date()) {
+    const lastSyncMs = icalSchedulerLastSyncMs(apt)
+    if (!lastSyncMs) return true
+    return now.getTime() - lastSyncMs >= icalSchedulerIntervalMs(apt, now)
+  }
+
+  function acquireIcalSchedulerLock() {
+    if (typeof window === 'undefined') return true
+    if (window.__alohandoteIcalSchedulerRunning) return false
+    const key = 'alohandote_ical_scheduler_lock_v223_5_9_1'
+    const now = Date.now()
+    try {
+      const current = JSON.parse(localStorage.getItem(key) || 'null')
+      if (current?.expiresAt && Number(current.expiresAt) > now) return false
+      localStorage.setItem(key, JSON.stringify({ expiresAt: now + 20 * 60 * 1000 }))
+    } catch (_) {}
+    window.__alohandoteIcalSchedulerRunning = true
+    return true
+  }
+
+  function releaseIcalSchedulerLock() {
+    if (typeof window === 'undefined') return
+    window.__alohandoteIcalSchedulerRunning = false
+    try { localStorage.removeItem('alohandote_ical_scheduler_lock_v223_5_9_1') } catch (_) {}
+  }
+
   async function syncAllExternalIcalsSilent() {
-    const accommodationsWithIcal = accommodations.filter((apt) => apt?.id && accommodationIcalUrls(apt).length)
-    for (const apt of accommodationsWithIcal) {
-      const urls = accommodationIcalUrls(apt)
-      try {
-        const fetchedCalendars = []
-        let index = 0
-        for (const url of urls) {
-          index += 1
-          const normalizedUrl = String(url || '').trim().replace(/^webcal:\/\//i, 'https://')
-          const response = await fetch(`/api/ics-proxy?url=${encodeURIComponent(normalizedUrl)}`)
-          if (!response.ok) throw new Error(`HTTP ${response.status}`)
-          const rawText = await response.text()
-          if (!rawText || !/BEGIN:VCALENDAR/i.test(rawText)) throw new Error('Respuesta iCal inválida')
-          const host = (() => { try { return new URL(normalizedUrl).hostname.replace(/^www\./, '') } catch { return `ical-${index}` } })()
-          const label = host.includes('digitaloceanspaces.com') || host.includes('estei') ? 'Estei' : host.includes('airbnb') ? 'Airbnb' : `iCal ${index}`
-          fetchedCalendars.push({ index, url: normalizedUrl, rawText, host, label })
+    if (!acquireIcalSchedulerLock()) return
+    try {
+      const now = new Date()
+      const accommodationsWithIcal = accommodations.filter((apt) => (
+        apt?.id && apt?.active !== false && accommodationIcalUrls(apt).length && icalSchedulerIsDue(apt, now)
+      ))
+
+      for (const apt of accommodationsWithIcal) {
+        // Se vuelve a validar antes de cada alojamiento por si otra pestaña/dispositivo ya actualizó Firestore.
+        if (!icalSchedulerIsDue(apt, new Date())) continue
+        const urls = accommodationIcalUrls(apt)
+        try {
+          const fetchedCalendars = []
+          let index = 0
+          for (const url of urls) {
+            index += 1
+            const normalizedUrl = String(url || '').trim().replace(/^webcal:\/\//i, 'https://')
+            if (!normalizedUrl) continue
+            const response = await fetch(`/api/ics-proxy?url=${encodeURIComponent(normalizedUrl)}`)
+            if (!response.ok) throw new Error(`HTTP ${response.status}`)
+            const rawText = await response.text()
+            if (!rawText || !/BEGIN:VCALENDAR/i.test(rawText)) throw new Error('Respuesta iCal inválida')
+            const host = (() => { try { return new URL(normalizedUrl).hostname.replace(/^www\./, '') } catch { return `ical-${index}` } })()
+            const label = host.includes('digitaloceanspaces.com') || host.includes('estei') ? 'Estei' : host.includes('airbnb') ? 'Airbnb' : `iCal ${index}`
+            fetchedCalendars.push({ index, url: normalizedUrl, rawText, host, label })
+          }
+          if (!fetchedCalendars.length) continue
+          await reconcileIcalEventsForAccommodation(apt, fetchedCalendars)
+          await syncPublicIcalBlocksForAccommodation(apt)
+          const preservedUrls = urls.slice(0, 4)
+          while (preservedUrls.length < 4) preservedUrls.push('')
+          const syncTimestamp = new Date().toISOString()
+          await accommodationsStore.editItem(apt.id, {
+            ...apt,
+            icalUrl: preservedUrls[0] || apt.icalUrl || '',
+            icalUrls: preservedUrls,
+            lastIcalSyncAt: syncTimestamp,
+            icalSyncStatus: fetchedCalendars.map((calendar, idx) => ({
+              url: calendar.url,
+              label: calendar.label,
+              status: 'correcto',
+              lastSyncAt: syncTimestamp,
+              events: countImportableIcsEvents(calendar.rawText),
+              index: idx + 1,
+            })),
+          })
+        } catch (err) {
+          console.warn(`Sincronización iCal silenciosa omitida para ${apt.name || apt.id}:`, err?.message || err)
         }
-        await reconcileIcalEventsForAccommodation(apt, fetchedCalendars)
-        await syncPublicIcalBlocksForAccommodation(apt)
-        const preservedUrls = urls.slice(0, 4)
-        while (preservedUrls.length < 4) preservedUrls.push('')
-        await accommodationsStore.editItem(apt.id, {
-          ...apt,
-          icalUrl: preservedUrls[0] || apt.icalUrl || '',
-          icalUrls: preservedUrls,
-          lastIcalSyncAt: new Date().toISOString(),
-          icalSyncStatus: fetchedCalendars.map((calendar, idx) => ({ url: calendar.url, label: calendar.label, status: 'correcto', lastSyncAt: new Date().toISOString(), events: countImportableIcsEvents(calendar.rawText), index: idx + 1 }))
-        })
-      } catch (err) {
-        console.warn(`Sincronización iCal silenciosa omitida para ${apt.name || apt.id}:`, err?.message || err)
       }
+    } finally {
+      releaseIcalSchedulerLock()
     }
   }
 
   useEffect(() => {
     if (!isFirebaseReady || !accommodations.length) return undefined
-    const timer = setInterval(() => { syncAllExternalIcalsSilent() }, 10 * 60 * 1000)
-    return () => clearInterval(timer)
+    // Heartbeat liviano: revisa cada 5 min, pero sincroniza solo cuando vence la ventana real.
+    const initialTimer = setTimeout(() => { syncAllExternalIcalsSilent() }, 20 * 1000)
+    const timer = setInterval(() => { syncAllExternalIcalsSilent() }, 5 * 60 * 1000)
+    return () => {
+      clearTimeout(initialTimer)
+      clearInterval(timer)
+    }
   }, [isFirebaseReady, accommodations, lodgingStore.items.length])
 
   async function clearSelectedAccommodationIcalBookings() {
@@ -5140,10 +5566,10 @@ function printVehicleContractFromOperation(operationItem = {}) {
       deliveryTime: operationItem?.deliveryTime || '12:00',
       returnTime: operationItem?.returnTime || '12:00',
       logisticsNote,
-      currentKm: vehicle.currentKm || '',
-      fuelLevel: 'Completo',
-      generalStatus: 'Bueno',
-      notes: '',
+      currentKm: sourceReservation.deliveryKm || sourceReservation.kmEntrega || vehicle.currentKm || '',
+      fuelLevel: sourceReservation.deliveryFuelLevel || 'Completo',
+      generalStatus: sourceReservation.deliveryStatusNote || 'Bueno',
+      notes: sourceReservation.deliveryNotes || '',
       dashboardPhoto: null,
       vehiclePhoto: null,
       responsible: sellerName(profile, user) || 'Operador',
@@ -5167,7 +5593,21 @@ function printVehicleContractFromOperation(operationItem = {}) {
       deliveryTime: operationItem?.deliveryTime || '12:00',
       returnTime: operationItem?.returnTime || '12:00',
       logisticsNote,
-      currentKm: vehicle.currentKm || '',
+      currentKm: sourceReservation.kmRecepcion || sourceReservation.deliveryKm || sourceReservation.kmEntrega || vehicle.currentKm || '',
+      startDate: sourceReservation.startDate || operationItem?.startDate || '',
+      endDate: sourceReservation.endDate || operationItem?.endDate || operationItem?.returnDate || '',
+      rentalDays: sourceReservation.rentalDays || String(daysForReservation(sourceReservation) || 1),
+      deliveryKm: sourceReservation.deliveryKm || sourceReservation.kmEntrega || vehicle.currentKm || '',
+      dailyKmLimit: num(sourceReservation.dailyKmLimit || DAILY_KM_LIMIT) || DAILY_KM_LIMIT,
+      additionalKmPurchased: reservationAdditionalKmPurchased(sourceReservation),
+      // V223.5.12: recepción vinculada a la entrega. Conserva como referencia
+      // el combustible y las observaciones registradas al momento de entregar.
+      departureFuelLevel: sourceReservation.deliveryFuelLevel || '',
+      departureGeneralStatus: sourceReservation.deliveryStatusNote || '',
+      departureNotes: sourceReservation.deliveryNotes || '',
+      fuelLevel: sourceReservation.deliveryFuelLevel || 'Completo',
+      generalStatus: sourceReservation.deliveryStatusNote || 'Bueno',
+      notes: sourceReservation.deliveryNotes || '',
       createdByName: sellerName(profile, user) || 'Operador',
     })
   }
@@ -5407,6 +5847,19 @@ function printVehicleContractFromOperation(operationItem = {}) {
   function handlePublicOperationClick(item = {}) {
     const link = publicOperationTaskUrl(item)
     window.location.href = link
+  }
+  function handlePublicOperationContractClick(event, item = {}) {
+    event?.preventDefault?.()
+    event?.stopPropagation?.()
+    printVehicleContractFromOperation(item)
+  }
+
+  function publicOperationRowActions(item = {}) {
+    const showContract = item.reservationType === 'vehicle' && vehicleContractAvailableForOperation(item)
+    return <div className="public-op-actions">
+      {showContract && <button type="button" className="secondary" onClick={(event)=>handlePublicOperationContractClick(event,item)}><FileText size={16}/> Contrato PDF</button>}
+      <button type="button" onClick={()=>handlePublicOperationClick(item)}>{publicOperationButtonLabel(item)}</button>
+    </div>
   }
 
   
@@ -5777,7 +6230,12 @@ function printVehicleContractFromOperation(operationItem = {}) {
           updatedAt: now,
         })
       }
-      await vehiclesStore.editItem(vehicle.id, { ...vehicle, currentKm: editingVehicleDelivery.currentKm, lastKmUpdateAt: now, lastKmUpdatedBy: editingVehicleDelivery.responsible || sellerName(profile, user) })
+      // V223.5.12: Logística puede completar la tarea aunque no tenga permiso
+      // para editar el catálogo maestro de vehículos. La reserva conserva KM,
+      // combustible y observaciones; admin/supervisor actualizan además el vehículo.
+      if (canManageVehicles) {
+        await vehiclesStore.editItem(vehicle.id, { ...vehicle, currentKm: editingVehicleDelivery.currentKm, lastKmUpdateAt: now, lastKmUpdatedBy: editingVehicleDelivery.responsible || sellerName(profile, user) })
+      }
       await logAudit('vehicle_delivery_completed', 'Renta Car', reservation?.id || vehicle.id, { ...editingVehicleDelivery, id: reservation?.id || vehicle.id, assetName: vehicle.name }, { currentKm: editingVehicleDelivery.currentKm, reservationId: reservation?.id || '' })
       setEditingVehicleDelivery(null)
       showSuccess('Entrega de vehículo guardada correctamente')
@@ -5807,7 +6265,10 @@ function printVehicleContractFromOperation(operationItem = {}) {
       }
       const inventoryItem = editingCleaningTask.inventoryItemId ? inventoryItemsStore.items.find((item) => item.id === editingCleaningTask.inventoryItemId) : null
       const quantity = num(editingCleaningTask.quantity || 0)
-      if (inventoryItem && quantity > 0) {
+      // V223.5.12: el perfil Logística puede cerrar la limpieza sin quedar
+      // bloqueado por permisos de Inventario. Solo perfiles autorizados descuentan
+      // stock; la solicitud queda igualmente registrada en la reserva.
+      if (inventoryItem && quantity > 0 && canManageInventory) {
         const nextQty = num(inventoryItem.quantity) - quantity
         if (nextQty < 0) return setError('No hay stock suficiente para descontar ese artículo.')
         const unitCost = num(inventoryItem.unitCost)
@@ -5842,6 +6303,8 @@ function printVehicleContractFromOperation(operationItem = {}) {
         cleaningDamagePhoto: damagePhoto,
         cleaningInventoryItemId: editingCleaningTask.inventoryItemId || '',
         cleaningInventoryQuantity: quantity || '',
+        cleaningInventoryPending: Boolean(inventoryItem && quantity > 0 && !canManageInventory),
+        cleaningInventoryPendingReason: inventoryItem && quantity > 0 && !canManageInventory ? 'Pendiente de descuento por un perfil con permiso de inventario' : '',
         receptionCompletedAt: now,
         updatedAt: now,
       })
@@ -5869,6 +6332,11 @@ function printVehicleContractFromOperation(operationItem = {}) {
         ? reservationsStore.items.find((item) => item.id === editingVehicleCheckin.reservationId)
         : findReceptionReservationForVehicle(vehicle.id)
       const linkedReservationId = matchedReservation?.id || editingVehicleCheckin.reservationId || ''
+      const deliveredForValidation = Number(matchedReservation?.deliveryKm || matchedReservation?.deliveryKmReal || editingVehicleCheckin.deliveryKm || 0)
+      const receivedForValidation = Number(editingVehicleCheckin.currentKm || 0)
+      if (deliveredForValidation > 0 && receivedForValidation < deliveredForValidation) {
+        return setError('El kilometraje de entrada no puede ser menor al kilometraje de salida.')
+      }
       if (publicOperationsMode && publicTokenRecord) {
         await savePublicOperationSubmission('vehicle_reception', { ...editingVehicleCheckin, taskId: editingVehicleCheckin.id || linkedReservationId || publicTaskId, assetName: vehicle.name || editingVehicleCheckin.assetName || '', currentKm: editingVehicleCheckin.currentKm, fuelLevel: editingVehicleCheckin.fuelLevel || '', generalStatus: editingVehicleCheckin.generalStatus || '', notes: editingVehicleCheckin.notes || '' })
         setEditingVehicleCheckin(null)
@@ -5897,29 +6365,42 @@ function printVehicleContractFromOperation(operationItem = {}) {
         const reservation = matchedReservation
         const delivered = Number(reservation?.deliveryKm || reservation?.deliveryKmReal || 0)
         const received = Number(editingVehicleCheckin.currentKm || 0)
-        const drivenKm = delivered && received >= delivered ? received - delivered : Number(reservation?.kmRecorridos || 0)
+        const kmAllowance = reservationKmAllowance(reservation, received)
+        const drivenKm = kmAllowance.kmDriven || Number(reservation?.kmRecorridos || 0)
         await reservationsStore.editItem(linkedReservationId, {
           ...reservation,
           deliveryKm: reservation.deliveryKm || (delivered ? String(delivered) : ''),
           kmRecepcion: editingVehicleCheckin.currentKm,
-          kmRecorridos: drivenKm ? String(drivenKm) : '',
+          kmRecorridos: drivenKm ? String(drivenKm) : '0',
+          dailyKmLimit: kmAllowance.dailyLimit,
+          includedKm: kmAllowance.includedKm,
+          additionalKmPurchased: kmAllowance.additionalKmPurchased,
+          authorizedKm: kmAllowance.authorizedKm,
+          excessKm: kmAllowance.excessKm,
           receptionAt: now,
           receivedBy: payload.createdByName,
           fuelLevelReception: payload.fuelLevel,
           receptionStatus: payload.generalStatus,
           receptionNotes: payload.notes,
+          departureFuelLevelSnapshot: editingVehicleCheckin.departureFuelLevel || reservation.deliveryFuelLevel || '',
+          departureStatusSnapshot: editingVehicleCheckin.departureGeneralStatus || reservation.deliveryStatusNote || '',
+          departureNotesSnapshot: editingVehicleCheckin.departureNotes || reservation.deliveryNotes || '',
           dashboardPhoto,
           vehiclePhoto,
           status: 'returned',
           returnedAt: now,
         })
       }
-      await vehiclesStore.editItem(vehicle.id, {
-        ...vehicle,
-        currentKm: editingVehicleCheckin.currentKm,
-        lastKmUpdateAt: now,
-        lastKmUpdatedBy: payload.createdByName,
-      })
+      // V223.5.12: recepción operativa guardable por Logística. La actualización
+      // del catálogo maestro del vehículo solo se ejecuta con permiso manageAssets.
+      if (canManageVehicles) {
+        await vehiclesStore.editItem(vehicle.id, {
+          ...vehicle,
+          currentKm: editingVehicleCheckin.currentKm,
+          lastKmUpdateAt: now,
+          lastKmUpdatedBy: payload.createdByName,
+        })
+      }
       await logAudit('vehicle_reception_completed', 'Renta Car', linkedReservationId || vehicle.id, { ...payload, id: linkedReservationId || vehicle.id, assetName: vehicle.name }, { currentKm: editingVehicleCheckin.currentKm, linkedReservationId })
       setEditingVehicleCheckin(null)
       setError('')
@@ -6002,6 +6483,11 @@ async function saveReservation(event = null) {
         amount: (isMaintenance || isNoDisponible) ? '' : String(paymentTotals.rawAmount || editingReservation.amount || ''),
         depositAmount: (isMaintenance || isNoDisponible) ? '' : editingReservation.depositAmount || '',
         approxKm: (isMaintenance || isNoDisponible) ? '' : editingReservation.approxKm || '',
+        // V223.5.14: congela los KM adicionales vendidos por la cotizadora.
+        dailyKmLimit: (isMaintenance || isNoDisponible) ? '' : DAILY_KM_LIMIT,
+        includedKm: (isMaintenance || isNoDisponible) ? '' : String(Math.max(1, reservationDays) * DAILY_KM_LIMIT),
+        additionalKmPurchased: (isMaintenance || isNoDisponible) ? '' : String(reservationAdditionalKmPurchased(editingReservation)),
+        authorizedKm: (isMaintenance || isNoDisponible) ? '' : String((Math.max(1, reservationDays) * DAILY_KM_LIMIT) + reservationAdditionalKmPurchased(editingReservation)),
         rentalDays: (isMaintenance || isNoDisponible) ? '' : String(reservationDays),
         dailyRate: (isMaintenance || isNoDisponible) ? '' : String(calculatedDailyRate || editingReservation.dailyRate || ''),
         pricePerKm: (isMaintenance || isNoDisponible) ? '' : currentKmRate(editingReservation),
@@ -6505,7 +6991,7 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
     const clientDocumentLabel = clientIdType === 'E' ? 'documento de identidad extranjero' : 'cédula de identidad'
     const clientCi = reservation.customerId ? `${clientIdType}-${String(reservation.customerId).replace(/^[VE]-/i,'')}` : '________________'
     const brand = vehicle.brand || vehicle.name || '__________'
-    const html = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=794, initial-scale=1, maximum-scale=1, user-scalable=no"/><title>Contrato${escapeHtml(clientName)}</title><style>${cleanPrintCss}@page{size:A4;margin:0}.page{page-break-inside:auto}*{box-sizing:border-box}html,body{width:794px;min-width:794px;margin:0 auto;padding:0;background:#eee;overflow-x:hidden}body{font-family:'Times New Roman',serif;color:#111}.actions{text-align:center;margin:18px}.actions button{background:#ff385c;color:white;border:0;border-radius:999px;padding:12px 20px;font-weight:bold;margin:4px}.actions button.secondary{background:#222}.page{width:210mm;min-height:297mm;background:white;margin:0 auto 24px;padding:13mm 14mm 12mm 14mm;line-height:1.19;font-size:12.2px;text-align:justify;position:relative}.lawyer-sign{position:absolute;top:7mm;left:12mm;width:38mm;height:auto}.title{text-align:center;font-weight:bold;font-size:15.5px;margin:20mm 0 12px;text-transform:uppercase}.clause{margin:8px 0}.signatures{display:grid;grid-template-columns:1fr 1fr;gap:42px;text-align:center;margin-top:55px}.line{border-top:1px solid #111;padding-top:8px}.small{font-size:13px}.upper{text-transform:uppercase}@media print{body{background:white}.actions{display:none}.page{margin:0;width:auto;min-height:auto;box-shadow:none}}</style></head><body><div class="actions">${pdfActionButtons(cleanDocumentFileName('Contrato renta car', reservation.customerName))}</div><main class="page"><img class="lawyer-sign" src="/firma-abogado.png" alt="Firma abogado"/><div class="title">CONTRATO PRIVADO DE ARRENDAMIENTO DE VEHÍCULO AUTOMOTOR</div><p>Entre, <strong>${landlordName}</strong>, venezolano, mayor de edad, titular de la cédula de identidad Nº <strong>V-20.634.357</strong>, domiciliado en la ciudad de Lechería, municipio Diego Bautista Urbaneja del estado Anzoátegui, teléfono 0424-8639102, quien a los efectos del presente contrato se denominará <strong>EL ARRENDADOR</strong>, por una parte; y por la otra, <strong>${escapeHtml(clientName)}</strong>, ${escapeHtml(clientNationalityText)}, mayor de edad, titular del ${escapeHtml(clientDocumentLabel)} Nº <strong>${escapeHtml(clientCi)}</strong>, domiciliado(a) en <strong>${escapeHtml(reservation.customerAddress || '________________________')}</strong>, quien en lo adelante y a los efectos del presente contrato se denominará <strong>EL ARRENDATARIO</strong>; se ha convenido en celebrar el presente contrato privado de arrendamiento de vehículo automotor, el cual se regirá por las disposiciones aplicables del Código Civil venezolano, por las normas de tránsito y circulación vigentes, por las condiciones particulares aquí establecidas y en base a las siguientes cláusulas:</p><p class="clause"><strong>PRIMERA:</strong> EL ARRENDADOR da en arrendamiento a EL ARRENDATARIO un (1) vehículo automotor de su exclusiva administración, identificado de la siguiente manera: marca <strong>${escapeHtml(upper(brand))}</strong>, modelo <strong>${escapeHtml(upper(vehicle.model || '__________'))}</strong>, año <strong>${escapeHtml(vehicle.year || '__________')}</strong>, color <strong>${escapeHtml(upper(vehicle.color || '__________'))}</strong>, placa <strong>${escapeHtml(upper(vehicle.plate || '__________'))}</strong>, serial de carrocería (VIN) <strong>${escapeHtml(upper(vehicle.vin || '__________'))}</strong>, con kilometraje aproximado de entrega de <strong>${escapeHtml(reservation.deliveryKm || vehicle.currentKm || '__________')} Km</strong>, el cual se entrega con sus documentos de circulación, llave principal, caucho de repuesto, herramientas básicas y demás accesorios disponibles.</p><p class="clause"><strong>SEGUNDA:</strong> EL ARRENDATARIO destinará el vehículo arrendado única y exclusivamente para uso particular, personal y lícito, quedando terminantemente prohibido darle un uso distinto al aquí establecido, así como emplearlo para transporte público o privado remunerado de pasajeros, transporte de carga no autorizada, competencias, remolque, aprendizaje de conducción, actividades ilícitas o cualquier otra finalidad que implique un riesgo mayor al uso normal y prudente del vehículo.</p><p class="clause"><strong>TERCERA:</strong> El plazo de duración del presente contrato será de <strong>${days}</strong> día(s) continuos, contados a partir del día <strong>${escapeHtml(start)}</strong> a las <strong>${escapeHtml(reservation.deliveryTime || '12:00')}</strong>, hasta el día <strong>${escapeHtml(end)}</strong> a las <strong>${escapeHtml(reservation.returnTime || '12:00')}</strong>. Cualquier prórroga deberá ser autorizada previamente por EL ARRENDADOR y constar por escrito, por mensaje verificable o por cualquier medio de comunicación que permita dejar constancia de la aceptación de ambas partes.</p><p class="clause"><strong>CUARTA:</strong> El canon de arrendamiento del presente contrato es la cantidad de <strong>${money(total)}</strong> por el período antes indicado. EL ARRENDATARIO pagará dicho canon a EL ARRENDADOR conforme a las condiciones comerciales acordadas entre las partes, dejando ambas partes constancia del monto total del servicio contratado.</p><p class="clause"><strong>QUINTA:</strong> EL ARRENDATARIO entrega a EL ARRENDADOR la cantidad de <strong>${money(deposit)}</strong> por concepto de depósito en garantía, destinado a asegurar el exacto cumplimiento de las obligaciones asumidas en el presente contrato, incluyendo, entre otras, daños al vehículo, exceso de kilometraje, multas, combustible faltante, retraso en la devolución, pérdida de documentos, llaves o accesorios y cualquier otro incumplimiento imputable a EL ARRENDATARIO. Dicho depósito será reintegrado total o parcialmente al momento de la devolución del vehículo, una vez efectuada la revisión correspondiente.</p><p class="clause"><strong>SEXTA:</strong> En caso de accidente, colisión, avería grave, hurto, robo, intento de robo, inmovilización, retención por autoridad competente o cualquier siniestro que afecte el vehículo, EL ARRENDATARIO deberá notificar de inmediato a EL ARRENDADOR, dar aviso a la autoridad correspondiente cuando sea procedente, abstenerse de abandonar el vehículo sin resguardo y cooperar plenamente con los trámites policiales, administrativos y de seguro.</p><p class="clause"><strong>SÉPTIMA:</strong> EL ARRENDATARIO se obliga a devolver el vehículo en la fecha y hora convenidas, en el mismo lugar de entrega o en el que indique EL ARRENDADOR, con el mismo nivel de combustible con que lo recibe, junto con sus documentos, llaves, accesorios y demás implementos.</p><p class="clause"><strong>OCTAVA:</strong> El incumplimiento por parte de EL ARRENDATARIO de una cualquiera de las obligaciones contenidas en el presente contrato dará derecho a EL ARRENDADOR a exigir la resolución inmediata del mismo o su cumplimiento forzoso, en ambos casos con daños y perjuicios, sin menoscabo de las demás acciones civiles, penales, administrativas o de cualquier otra naturaleza a que hubiere lugar conforme a derecho.</p><p>Se hacen dos (2) ejemplares de un mismo tenor y a un solo efecto, en <strong>${escapeHtml(city)}</strong>, a la fecha de entrega del vehículo: <strong>${escapeHtml(deliveryDate)}</strong>.</p><div class="signatures"><div><div class="line"><strong>${landlordName}</strong><br>EL ARRENDADOR<br>C.I. V-20.634.357</div></div><div><div class="line"><strong>${escapeHtml(clientName)}</strong><br>EL ARRENDATARIO<br>${escapeHtml(clientIdType === 'E' ? 'Doc. extranjero' : 'C.I.')} ${escapeHtml(clientCi)}</div></div></div></main></body></html>`
+    const html = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=794, initial-scale=1, maximum-scale=1, user-scalable=no"/><title>Contrato${escapeHtml(clientName)}</title><style>${cleanPrintCss}@page{size:A4;margin:0}.page{page-break-inside:auto}*{box-sizing:border-box}html,body{width:794px;min-width:794px;margin:0 auto;padding:0;background:#eee;overflow-x:hidden}body{font-family:'Times New Roman',serif;color:#111}.actions{text-align:center;margin:18px}.actions button{background:#ff385c;color:white;border:0;border-radius:999px;padding:12px 20px;font-weight:bold;margin:4px}.actions button.secondary{background:#222}.page{width:210mm;min-height:297mm;background:white;margin:0 auto 24px;padding:13mm 14mm 12mm 14mm;line-height:1.22;font-size:12.2px;text-align:justify;text-justify:inter-word;letter-spacing:0;word-spacing:normal;hyphens:none;white-space:normal;overflow-wrap:normal;word-break:normal;position:relative}.page p{margin:8px 0;text-align:justify;text-justify:inter-word;letter-spacing:0;word-spacing:normal;hyphens:none;white-space:normal;overflow-wrap:normal;word-break:normal}.lawyer-sign{position:absolute;top:7mm;left:12mm;width:38mm;height:auto}.title{text-align:center;font-weight:bold;font-size:15.5px;margin:20mm 0 12px;text-transform:uppercase}.clause{margin:8px 0}.signatures{display:grid;grid-template-columns:1fr 1fr;gap:42px;text-align:center;margin-top:55px}.line{border-top:1px solid #111;padding-top:8px}.small{font-size:13px}.upper{text-transform:uppercase}@media print{body{background:white}.actions{display:none}.page{margin:0;width:auto;min-height:auto;box-shadow:none}}</style></head><body><div class="actions">${pdfActionButtons(cleanDocumentFileName('Contrato renta car', reservation.customerName))}</div><main class="page contract-page"><img class="lawyer-sign" src="/firma-abogado.png" alt="Firma abogado"/><div class="title">CONTRATO PRIVADO DE ARRENDAMIENTO DE VEHÍCULO AUTOMOTOR</div><p>Entre, <strong>${landlordName}</strong>, venezolano, mayor de edad, titular de la cédula de identidad Nº <strong>V-20.634.357</strong>, domiciliado en la ciudad de Lechería, municipio Diego Bautista Urbaneja del estado Anzoátegui, teléfono 0424-8639102, quien a los efectos del presente contrato se denominará <strong>EL ARRENDADOR</strong>, por una parte; y por la otra, <strong>${escapeHtml(clientName)}</strong>, ${escapeHtml(clientNationalityText)}, mayor de edad, titular del ${escapeHtml(clientDocumentLabel)} Nº <strong>${escapeHtml(clientCi)}</strong>, domiciliado(a) en <strong>${escapeHtml(reservation.customerAddress || '________________________')}</strong>, quien en lo adelante y a los efectos del presente contrato se denominará <strong>EL ARRENDATARIO</strong>; se ha convenido en celebrar el presente contrato privado de arrendamiento de vehículo automotor, el cual se regirá por las disposiciones aplicables del Código Civil venezolano, por las normas de tránsito y circulación vigentes, por las condiciones particulares aquí establecidas y en base a las siguientes cláusulas:</p><p class="clause"><strong>PRIMERA:</strong> EL ARRENDADOR da en arrendamiento a EL ARRENDATARIO un (1) vehículo automotor de su exclusiva administración, identificado de la siguiente manera: marca <strong>${escapeHtml(upper(brand))}</strong>, modelo <strong>${escapeHtml(upper(vehicle.model || '__________'))}</strong>, año <strong>${escapeHtml(vehicle.year || '__________')}</strong>, color <strong>${escapeHtml(upper(vehicle.color || '__________'))}</strong>, placa <strong>${escapeHtml(upper(vehicle.plate || '__________'))}</strong>, serial de carrocería (VIN) <strong>${escapeHtml(upper(vehicle.vin || '__________'))}</strong>, con kilometraje aproximado de entrega de <strong>${escapeHtml(reservation.deliveryKm || vehicle.currentKm || '__________')} Km</strong>, el cual se entrega con sus documentos de circulación, llave principal, caucho de repuesto, herramientas básicas y demás accesorios disponibles.</p><p class="clause"><strong>SEGUNDA:</strong> EL ARRENDATARIO destinará el vehículo arrendado única y exclusivamente para uso particular, personal y lícito, quedando terminantemente prohibido darle un uso distinto al aquí establecido, así como emplearlo para transporte público o privado remunerado de pasajeros, transporte de carga no autorizada, competencias, remolque, aprendizaje de conducción, actividades ilícitas o cualquier otra finalidad que implique un riesgo mayor al uso normal y prudente del vehículo.</p><p class="clause"><strong>TERCERA:</strong> El plazo de duración del presente contrato será de <strong>${days}</strong> día(s) continuos, contados a partir del día <strong>${escapeHtml(start)}</strong> a las <strong>${escapeHtml(reservation.deliveryTime || '12:00')}</strong>, hasta el día <strong>${escapeHtml(end)}</strong> a las <strong>${escapeHtml(reservation.returnTime || '12:00')}</strong>. Cualquier prórroga deberá ser autorizada previamente por EL ARRENDADOR y constar por escrito, por mensaje verificable o por cualquier medio de comunicación que permita dejar constancia de la aceptación de ambas partes.</p><p class="clause"><strong>CUARTA:</strong> El canon de arrendamiento del presente contrato es la cantidad de <strong>${money(total)}</strong> por el período antes indicado. EL ARRENDATARIO pagará dicho canon a EL ARRENDADOR conforme a las condiciones comerciales acordadas entre las partes, dejando ambas partes constancia del monto total del servicio contratado.</p><p class="clause"><strong>QUINTA:</strong> EL ARRENDATARIO entrega a EL ARRENDADOR la cantidad de <strong>${money(deposit)}</strong> por concepto de depósito en garantía, destinado a asegurar el exacto cumplimiento de las obligaciones asumidas en el presente contrato, incluyendo, entre otras, daños al vehículo, exceso de kilometraje, multas, combustible faltante, retraso en la devolución, pérdida de documentos, llaves o accesorios y cualquier otro incumplimiento imputable a EL ARRENDATARIO. Dicho depósito será reintegrado total o parcialmente al momento de la devolución del vehículo, una vez efectuada la revisión correspondiente.</p><p class="clause"><strong>SEXTA:</strong> En caso de accidente, colisión, avería grave, hurto, robo, intento de robo, inmovilización, retención por autoridad competente o cualquier siniestro que afecte el vehículo, EL ARRENDATARIO deberá notificar de inmediato a EL ARRENDADOR, dar aviso a la autoridad correspondiente cuando sea procedente, abstenerse de abandonar el vehículo sin resguardo y cooperar plenamente con los trámites policiales, administrativos y de seguro.</p><p class="clause"><strong>SÉPTIMA:</strong> EL ARRENDATARIO se obliga a devolver el vehículo en la fecha y hora convenidas, en el mismo lugar de entrega o en el que indique EL ARRENDADOR, con el mismo nivel de combustible con que lo recibe, junto con sus documentos, llaves, accesorios y demás implementos.</p><p class="clause"><strong>OCTAVA:</strong> El incumplimiento por parte de EL ARRENDATARIO de una cualquiera de las obligaciones contenidas en el presente contrato dará derecho a EL ARRENDADOR a exigir la resolución inmediata del mismo o su cumplimiento forzoso, en ambos casos con daños y perjuicios, sin menoscabo de las demás acciones civiles, penales, administrativas o de cualquier otra naturaleza a que hubiere lugar conforme a derecho.</p><p>Se hacen dos (2) ejemplares de un mismo tenor y a un solo efecto, en <strong>${escapeHtml(city)}</strong>, a la fecha de entrega del vehículo: <strong>${escapeHtml(deliveryDate)}</strong>.</p><div class="signatures"><div><div class="line"><strong>${landlordName}</strong><br>EL ARRENDADOR<br>C.I. V-20.634.357</div></div><div><div class="line"><strong>${escapeHtml(clientName)}</strong><br>EL ARRENDATARIO<br>${escapeHtml(clientIdType === 'E' ? 'Doc. extranjero' : 'C.I.')} ${escapeHtml(clientCi)}</div></div></div></main></body></html>`
     writePrintableWindow(printWindow, html, cleanDocumentFileName('Contrato renta car', reservation.customerName))
     showSuccess('Contrato generado correctamente')
   }
@@ -6655,11 +7141,11 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
           {error && <div className="form-error">{error}</div>}
           {!publicTaskId && <div className="public-ops-section">
             <h3>Operaciones de hoy</h3>
-            {todayOps.length ? todayOps.map((item)=><div className="public-op-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.assetLabel} · {item.customerName} · {item.title} · {formatShortDate(item.operationDate)}</span></div><button type="button" onClick={()=>handlePublicOperationClick(item)}>{publicOperationButtonLabel(item)}</button></div>) : <div className="empty-state">No hay operaciones para hoy.</div>}
+            {todayOps.length ? todayOps.map((item)=><div className="public-op-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.assetLabel} · {item.customerName} · {item.title} · {formatShortDate(item.operationDate)}</span></div>{publicOperationRowActions(item)}</div>) : <div className="empty-state">No hay operaciones para hoy.</div>}
           </div>}
           {!publicTaskId && <div className="public-ops-section">
             <h3>Próximo día</h3>
-            {futureOps.length ? futureOps.map((item)=><div className="public-op-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.assetLabel} · {item.customerName} · {item.title} · {formatShortDate(item.operationDate)}</span></div><button type="button" onClick={()=>handlePublicOperationClick(item)}>{publicOperationButtonLabel(item)}</button></div>) : <div className="empty-state">No hay operaciones próximas.</div>}
+            {futureOps.length ? futureOps.map((item)=><div className="public-op-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.assetLabel} · {item.customerName} · {item.title} · {formatShortDate(item.operationDate)}</span></div>{publicOperationRowActions(item)}</div>) : <div className="empty-state">No hay operaciones próximas.</div>}
           </div>}
           {editingVehicleDelivery && <form className="public-reception-form embedded" onSubmit={saveVehicleDelivery}>
             <h3>Entrega de vehículo</h3>
@@ -6674,7 +7160,7 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
           </form>}
           {editingVehicleCheckin && <form className="public-reception-form embedded" onSubmit={saveVehicleReception}>
             <h3>Recepción de vehículo</h3>
-            {operationDetailLine(editingVehicleCheckin) && <div className="document-box operation-context"><strong>{editingVehicleCheckin.customerName || 'Cliente'}</strong><small>{operationDetailLine(editingVehicleCheckin)}</small></div>}{editingVehicleCheckin.logisticsNote && <section className="document-box operation-context"><h4>📋 Instrucciones logísticas</h4><p style={{ whiteSpace: 'pre-line', margin: 0 }}>{editingVehicleCheckin.logisticsNote}</p></section>}<label>Responsable de recibir<select value={editingVehicleCheckin?.createdByName || ''} onChange={(e)=>setEditingVehicleCheckin({ ...(editingVehicleCheckin || emptyVehicleCheckin(selectedVehicle?.id, profile, user)), createdByName:e.target.value })}>{operationsPeople.map((name)=><option key={name} value={name}>{name}</option>)}</select></label>
+            {operationDetailLine(editingVehicleCheckin) && <div className="document-box operation-context"><strong>{editingVehicleCheckin.customerName || 'Cliente'}</strong><small>{operationDetailLine(editingVehicleCheckin)}</small></div>}{editingVehicleCheckin.logisticsNote && <section className="document-box operation-context"><h4>📋 Instrucciones logísticas</h4><p style={{ whiteSpace: 'pre-line', margin: 0 }}>{editingVehicleCheckin.logisticsNote}</p></section>}{(editingVehicleCheckin.departureFuelLevel || editingVehicleCheckin.departureNotes || editingVehicleCheckin.departureGeneralStatus) && <section className="document-box operation-context"><h4>Datos registrados en la entrega</h4><small>Combustible de salida: <strong>{editingVehicleCheckin.departureFuelLevel || 'No registrado'}</strong></small><small>Estado de salida: <strong>{editingVehicleCheckin.departureGeneralStatus || 'No registrado'}</strong></small>{editingVehicleCheckin.departureNotes && <p style={{ whiteSpace:'pre-line', margin:'6px 0 0' }}>Observación de salida: {editingVehicleCheckin.departureNotes}</p>}</section>}<label>Responsable de recibir<select value={editingVehicleCheckin?.createdByName || ''} onChange={(e)=>setEditingVehicleCheckin({ ...(editingVehicleCheckin || emptyVehicleCheckin(selectedVehicle?.id, profile, user)), createdByName:e.target.value })}>{operationsPeople.map((name)=><option key={name} value={name}>{name}</option>)}</select></label>
             <label>Kilometraje recibido<input type="number" min="0" value={editingVehicleCheckin?.currentKm || ''} placeholder="Ej: 45650" onChange={(e)=>setEditingVehicleCheckin({ ...(editingVehicleCheckin || emptyVehicleCheckin(selectedVehicle?.id, profile, user)), currentKm: e.target.value })}/></label>
             <label>Nivel de combustible<select value={editingVehicleCheckin?.fuelLevel || 'Completo'} onChange={(e)=>setEditingVehicleCheckin({ ...(editingVehicleCheckin || emptyVehicleCheckin(selectedVehicle?.id, profile, user)), fuelLevel: e.target.value })}><option>Completo</option><option>3/4</option><option>Medio tanque</option><option>1/4</option><option>Bajo</option></select></label>
             <label>Estado general<select value={editingVehicleCheckin?.generalStatus || 'Bueno'} onChange={(e)=>setEditingVehicleCheckin({ ...(editingVehicleCheckin || emptyVehicleCheckin(selectedVehicle?.id, profile, user)), generalStatus: e.target.value })}><option>Bueno</option><option>Con observación</option><option>Requiere revisión</option><option>Requiere mantenimiento</option></select></label>
@@ -6795,10 +7281,10 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
           const title = reservation ? (normalizeStatus(reservation.status) === 'maintenance' ? 'Mantenimiento' : reservation.customerName || status?.label) : ''
           return <button key={index} className={`day-cell ${!date ? 'muted' : ''} ${status?.className || ''}`} onClick={() => date && (reservation ? openEditReservation(reservation) : openCreateReservation(date))}>{date && <><span className="day-number">{date.getDate()}</span>{reservation ? <span className="reservation-label">{title}</span> : selectedVehicle?.dailyRentalRate ? <span className="day-price">${Number(selectedVehicle.dailyRentalRate || 0).toLocaleString('es-VE', { maximumFractionDigits: 0 })}</span> : null}{reservation?.createdByName && <small className="seller-mini">{reservation.createdByName}</small>}</>}</button>
         })}</div></>}
-      </section> : moduleMode === 'carDeliveries' ? <section className="calendar-panel module-ops-panel">{!isLogistics && <div className="topbar"><div><span className="eyebrow">Renta Car</span><h2>Entregas de vehículos</h2><p className="vehicle-subtitle">Vehículos que deben ser entregados según la fecha de inicio de cada reserva. Solo admin.</p></div><div className="topbar-actions"><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística</button></div></div>}<div className="module-ops-grid"><section className="history-list pending-receptions vehicle-delivery-section"><h3>Entregas de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Entrega: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleDeliveryForm(item)}>Abrir entrega</button></div>) : <div className="empty-state">No hay vehículos por entregar hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximas entregas — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Entrega: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleDeliveryForm(item)}>Abrir entrega</button></div>) : <div className="empty-state">No hay entregas próximas.</div>}</section></div></section>
-      : moduleMode === 'carReceptions' ? <section className="calendar-panel module-ops-panel">{!isLogistics && <div className="topbar"><div><span className="eyebrow">Renta Car</span><h2>Recepciones de vehículos</h2><p className="vehicle-subtitle">Vehículos que deben ser recibidos según la fecha final de cada reserva. Al recibir se actualiza kilometraje y ROI.</p></div><div className="topbar-actions"><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística</button><button className="primary" onClick={() => openVehicleReception(selectedVehicle)}><Plus size={17}/> Nueva recepción</button></div></div>}<div className="module-ops-grid"><section className="history-list pending-receptions vehicle-reception-section"><h3>Recepciones de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Recepción: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleReceptionForm(item)}>Abrir recepción</button></div>) : <div className="empty-state">No hay vehículos por recibir hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximas recepciones — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Recepción: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleReceptionForm(item)}>Abrir recepción</button></div>) : <div className="empty-state">No hay recepciones próximas.</div>}</section></div><div className="history-list"><h3>Historial de recepción de vehículos</h3>{selectedVehicleCheckins.length ? selectedVehicleCheckins.slice(0, 20).map((item) => <div className="history-row" key={item.id}><div><strong>{Number(item.currentKm || 0).toLocaleString('es-VE')} km</strong><span>{item.vehicleName || selectedVehicle?.name} · {item.fuelLevel || 'Combustible no indicado'} · {item.generalStatus || 'Sin estado'}</span><small>{item.createdAt ? new Date(item.createdAt).toLocaleString('es-VE') : ''} · Recibido por {titleCaseName(item.createdByName || item.createdByEmail || 'Operador')}</small>{item.notes && <p>{item.notes}</p>}</div></div>) : <div className="empty-state">No hay recepciones registradas para este vehículo.</div>}</div></section>
-      : moduleMode === 'lodgingDeliveries' ? <section className="calendar-panel module-ops-panel"><div className="topbar"><div><span className="eyebrow">Alojamientos</span><h2>Check-in / Entregas</h2><p className="vehicle-subtitle">Alojamientos que deben entregarse al huésped según la fecha de inicio. Incluye reservas internas e iCal.</p></div><div className="topbar-actions"><button className="secondary" onClick={repairIcalAccommodationNames}>Reparar nombres iCal</button><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística / limpieza</button></div></div><div className="module-ops-grid"><section className="history-list pending-receptions lodging-delivery-section"><h3>Check-in de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-in: {formatShortDate(item.operationDate)}</span><small>{item.title}{item.sourceType === 'ical' ? ' · Importado por iCal' : ''}</small></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>markHandoverOperationDone(item)}>Check-in realizado</button>}</div>) : <div className="empty-state">No hay alojamientos por entregar hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximos check-in — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-in: {formatShortDate(item.operationDate)}</span></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>markHandoverOperationDone(item)}>Marcar check-in</button>}</div>) : <div className="empty-state">No hay check-in próximos.</div>}</section></div></section>
-      : moduleMode === 'lodgingReceptions' ? <section className="calendar-panel module-ops-panel">{!isLogistics && <div className="topbar"><div><span className="eyebrow">Alojamientos</span><h2>Check-out / Limpieza</h2><p className="vehicle-subtitle">Alojamientos por recibir según la fecha final. Al marcar limpieza se actualiza el conteo por alojamiento.</p></div><div className="topbar-actions"><button className="secondary" onClick={repairIcalAccommodationNames}>Reparar nombres iCal</button><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link limpieza</button></div></div>}<div className="module-ops-grid"><section className="history-list pending-receptions lodging-reception-section"><h3>Check-out / limpiezas de hoy</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-out: {formatShortDate(item.operationDate)} · Limpiezas: {item.cleaningsCount || 0}</span><small>{item.title}{item.sourceType === 'ical' ? ' · Importado por iCal' : ''}</small></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>openCleaningForm(item)}>Marcar limpieza</button>}</div>) : <div className="empty-state">No hay alojamientos por recibir hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximos check-out — próximo día</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-out: {formatShortDate(item.operationDate)} · Limpiezas: {item.cleaningsCount || 0}</span></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>openCleaningForm(item)}>Marcar limpieza</button>}</div>) : <div className="empty-state">No hay check-out próximos.</div>}</section></div></section>
+      </section> : moduleMode === 'carDeliveries' ? <section className="calendar-panel module-ops-panel">{!isLogistics && <div className="topbar"><div><span className="eyebrow">Renta Car</span><h2>Entregas de vehículos</h2><p className="vehicle-subtitle">Vehículos que deben ser entregados según la fecha de inicio de cada reserva. Solo admin.</p></div><div className="topbar-actions"><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística</button></div></div>}<div className="module-ops-grid"><section className="history-list pending-receptions vehicle-delivery-section"><h3>Entregas de hoy · {logisticsDayLabel(0)}</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Entrega: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleDeliveryForm(item)}>Abrir entrega</button></div>) : <div className="empty-state">No hay vehículos por entregar hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximas entregas · {logisticsDayLabel(1)}</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='delivery' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Entrega: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleDeliveryForm(item)}>Abrir entrega</button></div>) : <div className="empty-state">No hay entregas próximas.</div>}</section></div></section>
+      : moduleMode === 'carReceptions' ? <section className="calendar-panel module-ops-panel">{!isLogistics && <div className="topbar"><div><span className="eyebrow">Renta Car</span><h2>Recepciones de vehículos</h2><p className="vehicle-subtitle">Vehículos que deben ser recibidos según la fecha final de cada reserva. Al recibir se actualiza kilometraje y ROI.</p></div><div className="topbar-actions"><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística</button><button className="primary" onClick={() => openVehicleReception(selectedVehicle)}><Plus size={17}/> Nueva recepción</button></div></div>}<div className="module-ops-grid"><section className="history-list pending-receptions vehicle-reception-section"><h3>Recepciones de hoy · {logisticsDayLabel(0)}</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Recepción: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleReceptionForm(item)}>Abrir recepción</button></div>) : <div className="empty-state">No hay vehículos por recibir hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximas recepciones · {logisticsDayLabel(1)}</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='vehicle' && item.operation==='reception' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>Cliente: {item.customerName} · Recepción: {formatShortDate(item.operationDate)} · {money(item.totalAmount || item.amount)}</span>{operationDetailLine(item) && <small>{operationDetailLine(item)}</small>}</div><button className="secondary mini-action" onClick={()=>openVehicleReceptionForm(item)}>Abrir recepción</button></div>) : <div className="empty-state">No hay recepciones próximas.</div>}</section></div><div className="history-list"><h3>Historial de recepción de vehículos</h3>{selectedVehicleCheckins.length ? selectedVehicleCheckins.slice(0, 20).map((item) => <div className="history-row" key={item.id}><div><strong>{Number(item.currentKm || 0).toLocaleString('es-VE')} km</strong><span>{item.vehicleName || selectedVehicle?.name} · {item.fuelLevel || 'Combustible no indicado'} · {item.generalStatus || 'Sin estado'}</span><small>{item.createdAt ? new Date(item.createdAt).toLocaleString('es-VE') : ''} · Recibido por {titleCaseName(item.createdByName || item.createdByEmail || 'Operador')}</small>{item.notes && <p>{item.notes}</p>}</div></div>) : <div className="empty-state">No hay recepciones registradas para este vehículo.</div>}</div></section>
+      : moduleMode === 'lodgingDeliveries' ? <section className="calendar-panel module-ops-panel"><div className="topbar"><div><span className="eyebrow">Alojamientos</span><h2>Check-in / Entregas</h2><p className="vehicle-subtitle">Alojamientos que deben entregarse al huésped según la fecha de inicio. Incluye reservas internas e iCal.</p></div><div className="topbar-actions"><button className="secondary" onClick={repairIcalAccommodationNames}>Reparar nombres iCal</button><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística / limpieza</button></div></div><div className="module-ops-grid"><section className="history-list pending-receptions lodging-delivery-section"><h3>Check-in de hoy · {logisticsDayLabel(0)}</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-in: {formatShortDate(item.operationDate)}</span><small>{item.title}{item.sourceType === 'ical' ? ' · Importado por iCal' : ''}</small></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>markHandoverOperationDone(item)}>Check-in realizado</button>}</div>) : <div className="empty-state">No hay alojamientos por entregar hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximos check-in · {logisticsDayLabel(1)}</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='delivery' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-in: {formatShortDate(item.operationDate)}</span></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>markHandoverOperationDone(item)}>Marcar check-in</button>}</div>) : <div className="empty-state">No hay check-in próximos.</div>}</section></div></section>
+      : moduleMode === 'lodgingReceptions' ? <section className="calendar-panel module-ops-panel">{!isLogistics && <div className="topbar"><div><span className="eyebrow">Alojamientos</span><h2>Check-out / Limpieza</h2><p className="vehicle-subtitle">Alojamientos por recibir según la fecha final. Al marcar limpieza se actualiza el conteo por alojamiento.</p></div><div className="topbar-actions"><button className="secondary" onClick={repairIcalAccommodationNames}>Reparar nombres iCal</button><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link limpieza</button></div></div>}<div className="module-ops-grid"><section className="history-list pending-receptions lodging-reception-section"><h3>Check-out / limpiezas de hoy · {logisticsDayLabel(0)}</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='today').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='today').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-out: {formatShortDate(item.operationDate)} · Limpiezas: {item.cleaningsCount || 0}</span><small>{item.title}{item.sourceType === 'ical' ? ' · Importado por iCal' : ''}</small></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>openCleaningForm(item)}>Marcar limpieza</button>}</div>) : <div className="empty-state">No hay alojamientos por recibir hoy.</div>}</section><section className="history-list pending-receptions future-section"><h3>Próximos check-out · {logisticsDayLabel(1)}</h3>{operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='future').length ? operationsHandoverRows.filter((item)=>item.reservationType==='lodging' && item.operation==='reception' && item.group==='future').map((item)=><div className="history-row reception-row" key={item.id}><div><strong>{item.assetName}</strong><span>{item.sourceType === 'ical' ? 'iCal' : 'Huésped'}: {item.customerName} · Check-out: {formatShortDate(item.operationDate)} · Limpiezas: {item.cleaningsCount || 0}</span></div>{item.sourceType === 'ical' && item.assetName === 'Alojamiento sin vincular' ? <button className="secondary mini-action" onClick={()=>openIcalLinker(item)}>Vincular alojamiento</button> : <button className="secondary mini-action" onClick={()=>openCleaningForm(item)}>Marcar limpieza</button>}</div>) : <div className="empty-state">No hay check-out próximos.</div>}</section></div></section>
       : moduleMode === 'checkins' ? <section className="calendar-panel reception-panel delivery-reception-panel">
         <div className="topbar"><div><span className="eyebrow">Operación</span><h2>Entrega / Recepción</h2><p className="vehicle-subtitle">Controla por separado entregas de vehículos, check-in de alojamientos, recepciones de vehículos y check-out de alojamientos. Solo se muestran operaciones de hoy y próximo día.</p></div><div className="topbar-actions"><button className="secondary" onClick={copyOperationsPublicLink}>Copiar link logística / limpieza</button><button className="secondary" onClick={() => copyVehicleReceptionLink(selectedVehicle)}>Copiar link público vehículo</button><button className="primary" onClick={() => openVehicleReception(selectedVehicle)}><Plus size={17}/> Nueva recepción vehículo</button></div></div>
         <section className="analytics-strip"><div><Car size={18}/><span>Vehículo seleccionado</span><strong>{selectedVehicle?.name || 'Sin vehículo'}</strong></div><div><span>Kilometraje actual</span><strong>{selectedVehicle?.currentKm ? `${Number(selectedVehicle.currentKm).toLocaleString('es-VE')} km` : 'Sin registro'}</strong></div><div><span>Última actualización</span><strong>{selectedVehicle?.lastKmUpdateAt ? new Date(selectedVehicle.lastKmUpdateAt).toLocaleDateString('es-VE') : 'Pendiente'}</strong></div></section>
@@ -6858,7 +7344,7 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
           <label>Vendedor<select disabled={editingReservationReadOnly || (!isAdmin && isSellerProfile(profile?.role))} value={editingReservation.createdByName || normalizePersonName(sellerName(profile, user))} onChange={(e)=>setEditingReservation({...editingReservation,createdByName:e.target.value})}>{sellerOptionsForModule('cars').map((name)=><option key={name} value={name}>{name}</option>)}</select></label><label>Cliente<input disabled={editingReservationReadOnly} value={editingReservation.customerName} placeholder="Nombre del cliente" onBlur={() => applyLeadToCarDraft(editingReservation)} onChange={(e) => setEditingReservation({ ...editingReservation, customerName: e.target.value })} /></label>
           <div className="two-columns"><label>Cédula / identificación<div className="id-inline"><select disabled={editingReservationReadOnly} value={editingReservation.customerIdType || (String(editingReservation.customerId||'').toUpperCase().startsWith('E-') ? 'E' : 'V')} onChange={(e)=>setEditingReservation({...editingReservation, customerIdType:e.target.value, customerNationality:e.target.value==='E'?'extranjero':'venezolano'})}><option value="V">V</option><option value="E">E</option></select><input disabled={editingReservationReadOnly} value={editingReservation.customerId || ''} placeholder="Ej: 12.345.678" onBlur={() => applyLeadToCarDraft(editingReservation)} onChange={(e) => setEditingReservation({ ...editingReservation, customerId: e.target.value })} /></div></label><label>Teléfono<input disabled={editingReservationReadOnly} value={editingReservation.phone} placeholder="WhatsApp" onBlur={() => applyLeadToCarDraft(editingReservation)} onChange={(e) => setEditingReservation({ ...editingReservation, phone: e.target.value })} /></label></div><label>Correo electrónico<input disabled={editingReservationReadOnly} type="email" value={editingReservation.email || ''} placeholder="correo del cliente" onChange={(e) => setEditingReservation({ ...editingReservation, email: e.target.value })} /></label>
           <label>Domicilio del cliente<input disabled={editingReservationReadOnly} value={editingReservation.customerAddress || ''} placeholder="Ciudad / dirección" onChange={(e) => setEditingReservation({ ...editingReservation, customerAddress: e.target.value })} /></label>
-          <section className="quote-box"><h4>Calculadora cotizadora</h4><div className="two-columns"><label>Kilometraje aproximado<input disabled={editingReservationReadOnly} type="number" value={editingReservation.approxKm || ''} placeholder="Ej: 500" onChange={(e) => handleKmChange(e.target.value)} /></label><div className="pending-box"><span>Costo KM adicional</span><strong>{money(quoteFromKmAdjusted(editingReservation.approxKm, editingReservation))}</strong></div></div><div className="two-columns"><div className="pending-box"><span>Base por días</span><strong>{moneyDual(quoteBaseFromDays(daysForReservation(editingReservation), editingReservation.dailyRate || vehicleDayRate(vehicles.find((item)=>item.id===editingReservation.vehicleId))), rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate)}</strong></div><div className="pending-box"><span>Total servicio</span><strong>{moneyDual(totalQuoteForReservation(editingReservation), rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate)}</strong></div></div><div className="pending-box bs-total-box"><span>Costo en BS</span><strong>{bsMoney(amountBs(totalQuoteForReservation(editingReservation), rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate))}</strong></div><div className="rate-box compact-rates single-rate"><div><span>Tasa EURO</span><strong>{ratesLoading && !exchangeRates ? 'Consultando...' : (exchangeRates?.bcvEuro || editingReservation.bcvEuroRate) ? `${Number(exchangeRates?.bcvEuro || editingReservation.bcvEuroRate).toFixed(2)} Bs` : 'No disponible'}</strong></div></div>{ratesError && !exchangeRates?.bcvEuro && !editingReservation.bcvEuroRate && <small className="rate-error soft">No se pudo leer la tasa EURO en vivo.</small>}<div className="two-columns"><label>Número de días<input disabled type="number" value={daysForReservation(editingReservation)} readOnly /></label><label>Costo por día $<input disabled type="text" value={money(dailyFromTotal(editingReservation.totalAmount || quoteFromKmAdjusted(editingReservation.approxKm, editingReservation), daysForReservation(editingReservation)))} readOnly /></label></div><div className="pending-box"><span>Costo por día del servicio</span><strong>{money(dailyFromTotal(editingReservation.totalAmount || quoteFromKmAdjusted(editingReservation.approxKm, editingReservation), daysForReservation(editingReservation)))}</strong></div>{!isAdmin && <div className="pending-box"><span>Comisión vendedor 15%</span><strong>{money(commissionFromTotal(editingReservation.totalAmount || quoteFromKmAdjusted(editingReservation.approxKm, editingReservation)))}</strong></div>}</section>
+          <section className="quote-box"><h4>Calculadora cotizadora</h4><div className="two-columns"><label>KM adicionales contratados<input disabled={editingReservationReadOnly} type="number" value={editingReservation.approxKm || ''} placeholder="Ej: 500" onChange={(e) => handleKmChange(e.target.value)} /></label><div className="pending-box"><span>Costo de KM adicionales</span><strong>{money(quoteFromKmAdjusted(editingReservation.approxKm, editingReservation))}</strong></div></div><div className="two-columns"><div className="pending-box"><span>Base por días</span><strong>{moneyDual(quoteBaseFromDays(daysForReservation(editingReservation), editingReservation.dailyRate || vehicleDayRate(vehicles.find((item)=>item.id===editingReservation.vehicleId))), rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate)}</strong></div><div className="pending-box"><span>Total servicio</span><strong>{moneyDual(totalQuoteForReservation(editingReservation), rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate)}</strong></div></div><div className="pending-box bs-total-box"><span>Costo en BS</span><strong>{bsMoney(amountBs(totalQuoteForReservation(editingReservation), rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate))}</strong></div><div className="rate-box compact-rates single-rate"><div><span>Tasa EURO</span><strong>{ratesLoading && !exchangeRates ? 'Consultando...' : (exchangeRates?.bcvEuro || editingReservation.bcvEuroRate) ? `${Number(exchangeRates?.bcvEuro || editingReservation.bcvEuroRate).toFixed(2)} Bs` : 'No disponible'}</strong></div></div>{ratesError && !exchangeRates?.bcvEuro && !editingReservation.bcvEuroRate && <small className="rate-error soft">No se pudo leer la tasa EURO en vivo.</small>}<div className="two-columns"><label>Número de días<input disabled type="number" value={daysForReservation(editingReservation)} readOnly /></label><label>Costo por día $<input disabled type="text" value={money(dailyFromTotal(editingReservation.totalAmount || quoteFromKmAdjusted(editingReservation.approxKm, editingReservation), daysForReservation(editingReservation)))} readOnly /></label></div><div className="pending-box"><span>Costo por día del servicio</span><strong>{money(dailyFromTotal(editingReservation.totalAmount || quoteFromKmAdjusted(editingReservation.approxKm, editingReservation), daysForReservation(editingReservation)))}</strong></div>{!isAdmin && <div className="pending-box"><span>Comisión vendedor 15%</span><strong>{money(commissionFromTotal(editingReservation.totalAmount || quoteFromKmAdjusted(editingReservation.approxKm, editingReservation)))}</strong></div>}</section>
           <div className="two-columns"><label>Costo total del servicio $<input disabled={editingReservationReadOnly} type="number" value={editingReservation.totalAmount || ''} placeholder="Ej: 200" onChange={(e) => handleTotalAmountChange(e.target.value)} /></label><label>{editingReservation.id ? (isBsPaymentMethod(editingReservation.paymentMethod) ? 'Nuevo abono Bs' : 'Nuevo abono $') : paymentInputLabel(editingReservation.paymentMethod)}<input disabled={editingReservationReadOnly} type="number" value={editingReservation.amount} placeholder={editingReservation.id ? 'Deja igual si no agregas abono' : paymentInputPlaceholder(editingReservation.paymentMethod)} onChange={(e) => setEditingReservation({ ...editingReservation, amount: e.target.value, amountBs: String(paymentAmountBs(e.target.value, editingReservation.paymentMethod, rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate)), amountUsdEquivalent: String(paymentAmountUsd(e.target.value, editingReservation.paymentMethod, rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate)) })} /></label></div>{renderPaymentHistoryManager(editingReservation, setEditingReservation, editingReservationReadOnly)}
           <div className="two-columns"><label>Método del abono<select disabled={editingReservationReadOnly} value={editingReservation.paymentMethod || '$ Efectivo'} onChange={(e)=>setEditingReservation({...editingReservation,paymentMethod:e.target.value})}>{PAYMENT_METHODS.map((method)=><option key={method}>{method}</option>)}</select></label><div className="pending-box"><span>Abono equivalente $</span><strong>{money(paymentAmountUsd(editingReservation.amount, editingReservation.paymentMethod, rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate))}</strong><small>{bsMoney(paymentAmountBs(editingReservation.amount, editingReservation.paymentMethod, rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate))}</small></div></div>
           <div className="two-columns"><div className="pending-box"><span>Diferencia a pagar</span><strong>{moneyDual(pendingAmount(editingReservation, rateAwareExchangeRates), rateAwareExchangeRates, editingReservation.bcvEuroRate || officialEuroRate)}</strong></div><label>Depósito en garantía $<input disabled={editingReservationReadOnly} type="number" value={editingReservation.depositAmount || ''} placeholder="Ej: 100" onChange={(e) => setEditingReservation({ ...editingReservation, depositAmount: e.target.value })} /></label></div>
@@ -6879,7 +7365,7 @@ html,body{margin:0;padding:0;background:#f3eee6;color:#161616;font-family:Arial,
 
       {editingCleaningTask && <div className="modal-backdrop"><form className="modal small" onSubmit={saveCleaningTask}><div className="modal-header"><h3>Registro de limpieza</h3><button type="button" onClick={() => setEditingCleaningTask(null)}><X size={20}/></button></div><label>Alojamiento<input value={editingCleaningTask.accommodationName || accommodations.find((apt)=>apt.id===editingCleaningTask.accommodationId)?.name || ''} readOnly /></label>{operationDetailLine(editingCleaningTask) && <section className="document-box operation-context"><strong>{editingCleaningTask.customerName || 'Huésped'}</strong><small>{operationDetailLine(editingCleaningTask)}</small></section>}<label>Responsable de limpieza<select value={editingCleaningTask.responsible || ''} onChange={(e)=>setEditingCleaningTask({ ...editingCleaningTask, responsible:e.target.value })}>{operationsPeople.map((name)=><option key={name} value={name}>{name}</option>)}</select></label><label className="file-pick">Foto daño / incidencia<input type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingCleaningTask({ ...editingCleaningTask, _damagePhotoFile:e.target.files?.[0] || null })}/><small>{editingCleaningTask._damagePhotoFile?.name || 'Opcional: daño o incidencia'}</small></label><div className="two-columns"><label>Artículo usado<select value={editingCleaningTask.inventoryItemId || ''} onChange={(e)=>setEditingCleaningTask({ ...editingCleaningTask, inventoryItemId:e.target.value })}><option value="">Sin consumo</option>{inventoryItemsStore.items.filter((item)=>item.module === 'Alojamientos' || item.module === 'General').map((item)=><option key={item.id} value={item.id}>{item.name} · Stock {item.quantity}</option>)}</select></label><label>Cantidad<input type="number" min="0" step="1" value={editingCleaningTask.quantity || ''} onChange={(e)=>setEditingCleaningTask({ ...editingCleaningTask, quantity:e.target.value })}/></label></div><label>Observación<textarea rows="3" value={editingCleaningTask.notes || ''} placeholder="Daños, consumo, observaciones de limpieza..." onChange={(e)=>setEditingCleaningTask({ ...editingCleaningTask, notes:e.target.value })}/></label><div className="modal-actions"><button type="button" className="secondary" onClick={()=>setEditingCleaningTask(null)}>Cancelar</button><button type="submit" className="primary">Guardar limpieza</button></div></form></div>}
 
-      {editingVehicleCheckin && <div className="modal-backdrop"><form className="modal small" onSubmit={saveVehicleReception}><div className="modal-header"><h3>Recepción de vehículo</h3><button type="button" onClick={() => setEditingVehicleCheckin(null)}><X size={20}/></button></div>{operationDetailLine(editingVehicleCheckin) && <section className="document-box operation-context"><strong>{editingVehicleCheckin.customerName || 'Cliente'}</strong><small>{operationDetailLine(editingVehicleCheckin)}</small></section>}{vehicleContractAvailableForOperation(editingVehicleCheckin) && <div className="top-doc-actions"><button type="button" className="secondary" onClick={()=>printVehicleContractFromOperation(editingVehicleCheckin)}><FileText size={17}/> Contrato PDF</button></div>}{editingVehicleCheckin.logisticsNote && <section className="document-box operation-context"><h4>📋 Instrucciones logísticas</h4><p style={{ whiteSpace: 'pre-line', margin: 0 }}>{editingVehicleCheckin.logisticsNote}</p></section>}<label>Vehículo<select value={editingVehicleCheckin.vehicleId || ''} onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, vehicleId: e.target.value, currentKm: vehicles.find((v)=>v.id===e.target.value)?.currentKm || '' })}>{vehicles.map((vehicle)=><option key={vehicle.id} value={vehicle.id}>{vehicle.name}</option>)}</select></label><div className="two-columns"><label>Kilometraje recibido<input type="number" min="0" value={editingVehicleCheckin.currentKm || ''} placeholder="Ej: 45650" onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, currentKm: e.target.value })}/></label><label>Nivel de combustible<select value={editingVehicleCheckin.fuelLevel || 'Completo'} onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, fuelLevel: e.target.value })}><option>Completo</option><option>3/4</option><option>Medio tanque</option><option>1/4</option><option>Bajo</option></select></label></div><label>Responsable de recibir<select value={editingVehicleCheckin.createdByName || ''} onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, createdByName:e.target.value })}>{operationsPeople.map((name)=><option key={name} value={name}>{name}</option>)}</select></label><label>Reserva relacionada<select value={editingVehicleCheckin.reservationId || ''} onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, reservationId:e.target.value })}><option value="">Sin reserva relacionada</option>{reservationsStore.items.filter((r)=>r.vehicleId===editingVehicleCheckin.vehicleId && normalizeStatus(r.status)==='reserved').map((r)=><option key={r.id} value={r.id}>{r.customerName || 'Sin cliente'} · {formatShortDate(r.startDate)} - {formatShortDate(r.endDate)} · KM entrega {r.deliveryKm || 'N/D'}</option>)}</select></label><label>Estado general<select value={editingVehicleCheckin.generalStatus || 'Bueno'} onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, generalStatus: e.target.value })}><option>Bueno</option><option>Con observación</option><option>Requiere revisión</option><option>Requiere mantenimiento</option></select></label><div className="two-columns"><label className="file-pick">Foto tablero<input ref={dashboardPhotoInputRef} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, _dashboardPhotoFile: e.target.files?.[0] || null })}/><small>{editingVehicleCheckin._dashboardPhotoFile?.name || editingVehicleCheckin.dashboardPhoto?.name || 'Odómetro / tablero'}</small></label><label className="file-pick">Foto vehículo<input ref={vehiclePhotoInputRef} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, _vehiclePhotoFile: e.target.files?.[0] || null })}/><small>{editingVehicleCheckin._vehiclePhotoFile?.name || editingVehicleCheckin.vehiclePhoto?.name || 'Exterior del vehículo'}</small></label></div><label>Observación<textarea rows="3" value={editingVehicleCheckin.notes || ''} placeholder="Daños, limpieza, combustible, accesorios, comentarios del cliente..." onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, notes: e.target.value })}/></label><div className="modal-actions"><button type="button" className="secondary" onClick={()=>setEditingVehicleCheckin(null)}>Cancelar</button><button type="submit" className="primary">Guardar recepción</button></div></form></div>}
+      {editingVehicleCheckin && <div className="modal-backdrop"><form className="modal small" onSubmit={saveVehicleReception}><div className="modal-header"><h3>Recepción de vehículo</h3><button type="button" onClick={() => setEditingVehicleCheckin(null)}><X size={20}/></button></div>{operationDetailLine(editingVehicleCheckin) && <section className="document-box operation-context"><strong>{editingVehicleCheckin.customerName || 'Cliente'}</strong><small>{operationDetailLine(editingVehicleCheckin)}</small></section>}{vehicleContractAvailableForOperation(editingVehicleCheckin) && <div className="top-doc-actions"><button type="button" className="secondary" onClick={()=>printVehicleContractFromOperation(editingVehicleCheckin)}><FileText size={17}/> Contrato PDF</button></div>}{editingVehicleCheckin.logisticsNote && <section className="document-box operation-context"><h4>📋 Instrucciones logísticas</h4><p style={{ whiteSpace: 'pre-line', margin: 0 }}>{editingVehicleCheckin.logisticsNote}</p></section>}{(editingVehicleCheckin.departureFuelLevel || editingVehicleCheckin.departureNotes || editingVehicleCheckin.departureGeneralStatus) && <section className="document-box operation-context"><h4>Datos registrados en la entrega</h4><small>Combustible de salida: <strong>{editingVehicleCheckin.departureFuelLevel || 'No registrado'}</strong></small><small>Estado de salida: <strong>{editingVehicleCheckin.departureGeneralStatus || 'No registrado'}</strong></small>{editingVehicleCheckin.departureNotes && <p style={{ whiteSpace:'pre-line', margin:'6px 0 0' }}>Observación de salida: {editingVehicleCheckin.departureNotes}</p>}</section>}<label>Vehículo<select value={editingVehicleCheckin.vehicleId || ''} onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, vehicleId: e.target.value, currentKm: vehicles.find((v)=>v.id===e.target.value)?.currentKm || '' })}>{vehicles.map((vehicle)=><option key={vehicle.id} value={vehicle.id}>{vehicle.name}</option>)}</select></label><div className="two-columns"><label>Kilometraje recibido<input type="number" min="0" value={editingVehicleCheckin.currentKm || ''} placeholder="Ej: 45650" onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, currentKm: e.target.value })}/></label><label>Nivel de combustible<select value={editingVehicleCheckin.fuelLevel || 'Completo'} onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, fuelLevel: e.target.value })}><option>Completo</option><option>3/4</option><option>Medio tanque</option><option>1/4</option><option>Bajo</option></select></label></div>{(()=>{const reservation=reservationsStore.items.find((item)=>item.id===editingVehicleCheckin.reservationId)||editingVehicleCheckin;const km=reservationKmAllowance({...reservation,...editingVehicleCheckin,deliveryKm:editingVehicleCheckin.deliveryKm||reservation.deliveryKm,additionalKmPurchased:editingVehicleCheckin.additionalKmPurchased ?? reservation.additionalKmPurchased ?? reservation.approxKm},editingVehicleCheckin.currentKm);const invalid=km.deliveryKm>0&&km.receptionKm>0&&km.receptionKm<km.deliveryKm;return <section className="document-box operation-context"><h4>Control de kilometraje</h4><div className="two-columns"><small>KM salida: <strong>{km.deliveryKm ? `${km.deliveryKm} km` : 'No registrado'}</strong></small><small>KM recorridos: <strong>{invalid ? 'Revisar kilometraje' : `${km.kmDriven} km`}</strong></small></div><div className="two-columns"><small>Límite base ({km.days} día{km.days===1?'':'s'} × {km.dailyLimit}): <strong>{km.includedKm} km</strong></small><small>KM adicionales contratados: <strong>{km.additionalKmPurchased} km</strong></small></div><small>Límite total autorizado: <strong>{km.authorizedKm} km</strong></small>{invalid ? <p style={{color:'#b42318',fontWeight:700,margin:'8px 0 0'}}>El kilometraje de entrada no puede ser menor al de salida.</p> : km.excessKm>0 ? <p style={{color:'#b42318',fontWeight:700,margin:'8px 0 0'}}>Exceso no contratado: {km.excessKm} km</p> : <p style={{color:'#177245',fontWeight:700,margin:'8px 0 0'}}>Dentro del kilometraje contratado.</p>}</section>})()}<label>Responsable de recibir<select value={editingVehicleCheckin.createdByName || ''} onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, createdByName:e.target.value })}>{operationsPeople.map((name)=><option key={name} value={name}>{name}</option>)}</select></label><label>Reserva relacionada<select value={editingVehicleCheckin.reservationId || ''} onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, reservationId:e.target.value })}><option value="">Sin reserva relacionada</option>{reservationsStore.items.filter((r)=>r.vehicleId===editingVehicleCheckin.vehicleId && normalizeStatus(r.status)==='reserved').map((r)=><option key={r.id} value={r.id}>{r.customerName || 'Sin cliente'} · {formatShortDate(r.startDate)} - {formatShortDate(r.endDate)} · KM entrega {r.deliveryKm || 'N/D'}</option>)}</select></label><label>Estado general<select value={editingVehicleCheckin.generalStatus || 'Bueno'} onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, generalStatus: e.target.value })}><option>Bueno</option><option>Con observación</option><option>Requiere revisión</option><option>Requiere mantenimiento</option></select></label><div className="two-columns"><label className="file-pick">Foto tablero<input ref={dashboardPhotoInputRef} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, _dashboardPhotoFile: e.target.files?.[0] || null })}/><small>{editingVehicleCheckin._dashboardPhotoFile?.name || editingVehicleCheckin.dashboardPhoto?.name || 'Odómetro / tablero'}</small></label><label className="file-pick">Foto vehículo<input ref={vehiclePhotoInputRef} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, _vehiclePhotoFile: e.target.files?.[0] || null })}/><small>{editingVehicleCheckin._vehiclePhotoFile?.name || editingVehicleCheckin.vehiclePhoto?.name || 'Exterior del vehículo'}</small></label></div><label>Observación<textarea rows="3" value={editingVehicleCheckin.notes || ''} placeholder="Daños, limpieza, combustible, accesorios, comentarios del cliente..." onChange={(e)=>setEditingVehicleCheckin({ ...editingVehicleCheckin, notes: e.target.value })}/></label><div className="modal-actions"><button type="button" className="secondary" onClick={()=>setEditingVehicleCheckin(null)}>Cancelar</button><button type="submit" className="primary">Guardar recepción</button></div></form></div>}
       {editingVehicle && canManageVehicles && <div className="modal-backdrop"><form className="modal small" onSubmit={saveVehicle}><div className="modal-header"><h3>{editingVehicle.id ? 'Editar vehículo' : 'Agregar vehículo'}</h3><button type="button" onClick={() => setEditingVehicle(null)}><X size={20} /></button></div><label>Nombre<input value={editingVehicle.name} placeholder="Ej: Saipa Quick" onChange={(e) => setEditingVehicle({ ...editingVehicle, name: e.target.value })} /></label><div className="two-columns"><label>Marca<input value={editingVehicle.brand || ''} placeholder="Saipa" onChange={(e) => setEditingVehicle({ ...editingVehicle, brand: e.target.value })} /></label><label>Modelo<input value={editingVehicle.model || ''} placeholder="Quick" onChange={(e) => setEditingVehicle({ ...editingVehicle, model: e.target.value })} /></label></div><div className="two-columns"><label>Tipo de vehículo<select value={editingVehicle.vehicleType || 'Sedan'} onChange={(e)=>setEditingVehicle({...editingVehicle, vehicleType:e.target.value})}><option>Sedan</option><option>Hatchback</option><option>Pick up</option><option>SUV</option><option>Van</option></select></label><label>Transmisión<select value={editingVehicle.transmission || 'Automático'} onChange={(e)=>setEditingVehicle({...editingVehicle, transmission:e.target.value})}><option>Automático</option><option>Sincrónico</option></select></label></div><div className="two-columns"><label>Año<input value={editingVehicle.year || ''} placeholder="2023" onChange={(e) => setEditingVehicle({ ...editingVehicle, year: e.target.value })} /></label><label>Color<input value={editingVehicle.color || ''} placeholder="Plateado" onChange={(e) => setEditingVehicle({ ...editingVehicle, color: e.target.value })} /></label></div><div className="two-columns"><label>Combustible<select value={editingVehicle.fuelType || 'Gasolina'} onChange={(e)=>setEditingVehicle({...editingVehicle, fuelType:e.target.value})}><option>Gasolina</option><option>Diesel</option><option>Híbrido</option><option>Eléctrico</option></select></label><label>Placa / referencia<input value={editingVehicle.plate || ''} placeholder="AC670CR" onChange={(e) => setEditingVehicle({ ...editingVehicle, plate: e.target.value })} /></label></div><label>Serial de carrocería / VIN<input value={editingVehicle.vin || ''} placeholder="NAS841100P1188481" onChange={(e) => setEditingVehicle({ ...editingVehicle, vin: e.target.value })} /></label><section className="document-box"><h4>Modelo comercial</h4><div className="two-columns"><label>Tipo de vehículo<select value={editingVehicle.ownershipType || 'Propio'} onChange={(e)=>setEditingVehicle({...editingVehicle,ownershipType:e.target.value})}><option>Propio</option><option>Aliado</option></select></label>{editingVehicle.ownershipType === 'Aliado' && <label>Propietario / aliado<input value={editingVehicle.allyOwnerName || ''} placeholder="Nombre del propietario" onChange={(e)=>setEditingVehicle({...editingVehicle,allyOwnerName:e.target.value})}/></label>}</div>{editingVehicle.ownershipType === 'Aliado' && <div className="two-columns"><label>Modelo ganancia<select value={editingVehicle.allyProfitMode || 'fixed'} onChange={(e)=>setEditingVehicle({...editingVehicle,allyProfitMode:e.target.value})}><option value="fixed">Monto fijo $</option><option value="percent">Porcentaje %</option></select></label><label>{editingVehicle.allyProfitMode === 'percent' ? 'Porcentaje Alohandote %' : 'Ganancia Alohandote $'}<input type="number" min="0" step="0.01" value={editingVehicle.allyProfitValue || ''} placeholder={editingVehicle.allyProfitMode === 'percent' ? 'Ej: 25' : 'Ej: 25'} onChange={(e)=>setEditingVehicle({...editingVehicle,allyProfitValue:e.target.value})}/></label></div>}<small>Propio: el ingreso completo pertenece a Alohandote. Aliado: el sistema separa ganancia Alohandote y cuenta por pagar al propietario.</small></section><label>URL ubicación Google Maps<input value={editingVehicle.mapsUrl || ''} placeholder="https://maps.google.com/..." onChange={(e) => setEditingVehicle({ ...editingVehicle, mapsUrl: e.target.value })} /></label><div className="two-columns"><label>Costo por día $<input type="number" step="0.01" min="0" value={editingVehicle.dailyRentalRate || ''} placeholder="Ej: 50" onChange={(e) => setEditingVehicle({ ...editingVehicle, dailyRentalRate: e.target.value })} /></label><label>Costo del KM adicional $<input type="number" step="0.01" min="0" value={editingVehicle.pricePerKm ?? KM_RATE} placeholder="Ej: 0.30" onChange={(e) => setEditingVehicle({ ...editingVehicle, pricePerKm: e.target.value })} /></label></div><label>Kilometraje actual<input type="number" min="0" value={editingVehicle.currentKm || ''} placeholder="Ej: 45200" onChange={(e) => setEditingVehicle({ ...editingVehicle, currentKm: e.target.value, lastKmUpdateAt: new Date().toISOString(), lastKmUpdatedBy: sellerName(profile, user) })} /></label><label>Inversión del vehículo $<input type="number" min="0" step="0.01" value={editingVehicle.investmentCost || ''} placeholder="Ej: 8500" onChange={(e)=>setEditingVehicle({...editingVehicle, investmentCost:e.target.value})}/></label><div className="feature-grid"><label><input type="checkbox" checked={!!editingVehicle.parkingSensors} onChange={(e)=>setEditingVehicle({...editingVehicle,parkingSensors:e.target.checked})}/> Sensores de estacionamiento</label><label><input type="checkbox" checked={!!editingVehicle.powerSteering} onChange={(e)=>setEditingVehicle({...editingVehicle,powerSteering:e.target.checked})}/> Dirección asistida</label><label><input type="checkbox" checked={!!editingVehicle.bluetooth} onChange={(e)=>setEditingVehicle({...editingVehicle,bluetooth:e.target.checked})}/> Bluetooth</label><label><input type="checkbox" checked={!!editingVehicle.sunroof} onChange={(e)=>setEditingVehicle({...editingVehicle,sunroof:e.target.checked})}/> Quemacoco</label><label><input type="checkbox" checked={!!editingVehicle.ac} onChange={(e)=>setEditingVehicle({...editingVehicle,ac:e.target.checked})}/> A/A</label><label><input type="checkbox" checked={!!editingVehicle.airbag} onChange={(e)=>setEditingVehicle({...editingVehicle,airbag:e.target.checked})}/> Airbag</label><label><input type="checkbox" checked={!!editingVehicle.powerWindows} onChange={(e)=>setEditingVehicle({...editingVehicle,powerWindows:e.target.checked})}/> Vidrios eléctricos</label><label><input type="checkbox" checked={!!editingVehicle.screen} onChange={(e)=>setEditingVehicle({...editingVehicle,screen:e.target.checked})}/> Pantalla</label></div><section className="photo-manager"><div className="photo-manager-head"><div><strong>Fotos del catálogo</strong><small>Ordena o elimina fotos antes de guardar.</small></div><span>{(Array.isArray(editingVehicle.photos)?editingVehicle.photos.length:0) + Array.from(editingVehicle._photoFiles || []).length}/9</span></div>{Array.isArray(editingVehicle.photos) && editingVehicle.photos.length > 0 && <div className="photo-grid-editor">{editingVehicle.photos.slice(0,9).map((photo,index)=><figure key={`veh-${index}`}><img src={photoUrl(photo)} alt={`Foto ${index+1}`}/><figcaption>Foto {index+1}</figcaption><div className="photo-tools"><button type="button" onClick={()=>moveVehiclePhoto(index,-1)} disabled={index===0}>←</button><button type="button" onClick={()=>moveVehiclePhoto(index,1)} disabled={index===editingVehicle.photos.length-1}>→</button><button type="button" className="danger-mini" onClick={()=>removeVehiclePhoto(index)}>✕</button></div></figure>)}</div>}<label className="file-pick">Agregar fotos del vehículo<input type="file" multiple accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" onChange={(e)=>setEditingVehicle({...editingVehicle,_photoFiles:Array.from(e.target.files || []).slice(0, Math.max(0, 9 - (Array.isArray(editingVehicle.photos)?editingVehicle.photos.length:0)))})}/><small>JPG, PNG, WEBP o HEIC. Máximo 9 fotos.</small></label></section><label>Observación del vehículo<textarea rows="3" value={editingVehicle.notes || ''} placeholder="Seguro, seriales, condiciones, etc." onChange={(e) => setEditingVehicle({ ...editingVehicle, notes: e.target.value })} /></label><div className="modal-actions">{editingVehicle.id && <button type="button" className="danger" onClick={() => deleteVehicle(editingVehicle)}><Trash2 size={17} /> Eliminar</button>}{editingVehicle.id && <button type="button" className="secondary" onClick={()=>shareVehicleCatalog(editingVehicle)}>Catálogo PDF / Compartir</button>}<button type="submit" className="primary">Guardar vehículo</button></div></form></div>}
     </main>
   )

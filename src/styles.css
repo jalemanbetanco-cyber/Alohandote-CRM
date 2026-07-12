@@ -3773,3 +3773,33 @@ textarea:focus-visible {
 .ical-sync-status-row:first-of-type{border-top:0;padding-top:0}
 .ical-sync-status-row span{font-weight:800;color:#1f1f1f}
 .ical-sync-status-row small{color:#6f6259;font-size:.76rem;line-height:1.25}
+
+/* V223.5.10 HOTFIX MOBILE OPERACIONES: acciones visibles en la lista de tareas. */
+.public-op-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.public-op-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+@media (max-width: 768px) {
+  .public-op-row {
+    align-items: stretch;
+  }
+  .public-op-actions {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+  .public-op-actions button {
+    width: 100%;
+    min-height: 44px;
+  }
+}

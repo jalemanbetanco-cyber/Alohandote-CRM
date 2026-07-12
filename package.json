@@ -45,7 +45,9 @@
     "test:v2217": "node tests/v2217-ical-reconcile.test.mjs",
     "test:v2218": "node tests/v2218-hotfix-abonos-mobile-roi.test.mjs",
     "test:v2219": "node tests/v2219-hotfix-pdf-payment-return.test.mjs",
-    "test:v22119": "node tests/v22119-link-operaciones-seguro.test.mjs"
+    "test:v22119": "node tests/v22119-link-operaciones-seguro.test.mjs",
+    "test:v223510": "node tests/v223510-hotfix-regression.test.mjs",
+    "hotfix:v223510:check": "npm run test:v223510 && npm run test:business && npm run test:v2217 && npm run build"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.4",

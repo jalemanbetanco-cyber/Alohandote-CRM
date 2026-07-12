@@ -10,6 +10,11 @@ const VITE_FIREBASE_PROJECT_ID = String(process.env.VITE_FIREBASE_PROJECT_ID || 
 const PROJECT_ID = ENV_FIREBASE_PROJECT_ID || (VITE_FIREBASE_PROJECT_ID === 'alohandote-produccion' ? VITE_FIREBASE_PROJECT_ID : 'alohandote-produccion')
 const API_KEY = process.env.FIREBASE_API_KEY || process.env.VITE_FIREBASE_API_KEY || ''
 
+// V223.5.9: caché de exportación para evitar lecturas repetidas cuando Airbnb/Estei
+// consultan el mismo feed varias veces en pocos minutos.
+const ICAL_CACHE_TTL_MS = 30 * 60 * 1000
+const icalBodyCache = new Map()
+
 export function addDaysToIsoDate(value, days = 1) {
   if (!value) return ''
   const [year, month, day] = String(value).slice(0, 10).split('-').map(Number)
@@ -76,35 +81,46 @@ export async function fetchAllDocuments(collectionName) {
   return docs
 }
 
-async function fetchLodgingIcalDocuments() {
-  // V223.5.2.8: export iCal autocurativo.
-  // Antes se devolvía publicIcalBlocks si la colección tenía cualquier documento.
-  // Eso podía dejar feeds vacíos/intermitentes cuando publicIcalBlocks estaba incompleto
-  // para un alojamiento específico. Ahora combinamos fuente pública + reservas internas.
+async function fetchDocumentsByAccommodation(collectionName, accommodationId) {
+  const auth = await getFirestoreAuthHeaders()
+  const key = auth.queryKey && API_KEY ? `?key=${encodeURIComponent(API_KEY)}` : ''
+  const url = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents:runQuery${key}`
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { ...auth.headers, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      structuredQuery: {
+        from: [{ collectionId: collectionName }],
+        where: {
+          fieldFilter: {
+            field: { fieldPath: 'accommodationId' },
+            op: 'EQUAL',
+            value: { stringValue: String(accommodationId || '') },
+          },
+        },
+        limit: 300,
+      },
+    }),
+  })
+  if (!response.ok) throw new Error(`Firestore REST ${response.status} (${auth.mode}) ${collectionName}`)
+  const rows = await response.json()
+  return rows.map((row) => row.document).filter(Boolean)
+}
+
+async function fetchLodgingIcalDocuments(accommodationId) {
+  // V223.5.9: consulta dirigida por alojamiento. Evita descargar colecciones completas
+  // en cada solicitud pública del feed.
   const docs = []
   try {
-    const publicDocs = await fetchAllDocuments('publicIcalBlocks')
-    docs.push(...publicDocs)
+    docs.push(...await fetchDocumentsByAccommodation('publicIcalBlocks', accommodationId))
   } catch (error) {
     console.warn('iCal publicIcalBlocks no disponible:', error?.message || error)
   }
   try {
-    const privateDocs = await fetchAllDocuments('lodgingReservations')
-    docs.push(...privateDocs)
+    docs.push(...await fetchDocumentsByAccommodation('lodgingReservations', accommodationId))
   } catch (error) {
     console.warn('iCal lodgingReservations no disponible:', error?.message || error)
   }
-  console.log(
-  "ICAL_DOC_SAMPLE",
-  JSON.stringify(
-    docs.slice(0,3).map(doc => ({
-      name: doc.name,
-      fields: Object.keys(doc.fields || {})
-    })),
-    null,
-    2
-  )
-)
   return docs
 }
 
@@ -113,7 +129,7 @@ export async function buildLodgingIcalBody(rawAccommodationId) {
   const accommodationId = safeSlug(rawAccommodationId)
   if (!accommodationId) throw new Error('Missing accommodationId')
 
-  const docs = await fetchLodgingIcalDocuments()
+  const docs = await fetchLodgingIcalDocuments(accommodationId)
   const events = []
   const seen = new Set()
   for (const doc of docs) {
@@ -183,20 +199,6 @@ const rawEnd = String(
       'END:VEVENT',
     ].join('\r\n'))
   }
-console.log('ICAL_DEBUG', {
-  projectId: PROJECT_ID,
-  requestedAccommodationId: accommodationId,
-  docsRead: docs.length,
-  candidates: docs.slice(0, 20).map((doc) => ({
-    name: doc.name,
-    accommodationId: fieldValue(doc.fields || {}, 'accommodationId'),
-    lodgingId: fieldValue(doc.fields || {}, 'lodgingId'),
-    propertyId: fieldValue(doc.fields || {}, 'propertyId'),
-    startDate: fieldValue(doc.fields || {}, 'startDate'),
-    endDate: fieldValue(doc.fields || {}, 'endDate'),
-    status: fieldValue(doc.fields || {}, 'status'),
-  })),
-})
   if (!events.length) {
     // Algunos importadores externos rechazan feeds completamente vacíos.
     // Evento histórico inocuo: no bloquea disponibilidad futura.
@@ -232,14 +234,21 @@ export async function sendLodgingIcal(req, res, rawAccommodationId) {
       res.status(400).send('Missing accommodationId')
       return
     }
-    const body = await buildLodgingIcalBody(accommodationId)
+    const cached = icalBodyCache.get(accommodationId)
+    let body = ''
+    if (cached && cached.expiresAt > Date.now()) {
+      body = cached.body
+    } else {
+      body = await buildLodgingIcalBody(accommodationId)
+      icalBodyCache.set(accommodationId, { body, expiresAt: Date.now() + ICAL_CACHE_TTL_MS })
+    }
     setSecurityHeaders(res, { calendar: true })
     // V187: headers estrictos para importadores externos.
     res.setHeader('X-Alohandote-Ical-Project', PROJECT_ID)
     res.setHeader('Content-Type', 'text/calendar; charset=utf-8')
     res.setHeader('Content-Disposition', `attachment; filename="alohandote-${accommodationId}.ics"`)
     res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Cache-Control', 'public, max-age=15, s-maxage=15, stale-while-revalidate=15')
+    res.setHeader('Cache-Control', 'public, max-age=1800, s-maxage=1800, stale-while-revalidate=300')
     res.setHeader('X-Robots-Tag', 'noindex')
     if (req.method === 'HEAD') {
       res.status(200).end()

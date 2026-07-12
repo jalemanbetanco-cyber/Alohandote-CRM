@@ -1,0 +1,8 @@
+V223.5.14 - Hotfix quirúrgico
+
+1. Contrato PDF unificado para Admin y Logística mediante una sola ruta A4 fija.
+2. Corrección del congelamiento de KM adicionales contratados desde la calculadora.
+3. Compatibilidad con reservas históricas mediante approxKm.
+
+Reemplazar: src/App.jsx
+Validar: npm run build

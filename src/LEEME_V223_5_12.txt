@@ -1,0 +1,12 @@
+V223.5.12 - Hotfix Entrega/Recepción + Perfil Logística
+
+1. Reemplazar src/App.jsx por el App.jsx incluido.
+2. Ejecutar: npm run build
+3. Probar primero en Preview.
+
+Cambios:
+- Recepción carga combustible, estado y observaciones guardados en la entrega.
+- Reabrir entrega conserva sus datos ya registrados.
+- Perfil Logística puede guardar entrega y recepción sin intentar editar el catálogo maestro de vehículos.
+- Perfil Logística puede marcar limpieza como realizada sin quedar bloqueado por permisos de inventario.
+- Si Logística selecciona inventario, queda marcado como pendiente para descuento por un perfil autorizado.
